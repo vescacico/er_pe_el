@@ -242,7 +242,7 @@ class FriendService {
     }
   }
 
-  /// Send friend request
+  /// Send friend request (uses batch for atomicity)
   static Future<String?> sendFriendRequest({
     required String fromUid,
     required String fromName,
@@ -281,14 +281,15 @@ class FriendService {
 
       final requestId = _firestore.collection('friend_requests').doc().id;
       final now = Timestamp.now();
+      final batch = _firestore.batch();
 
       // Simpan request di penerima
-      await _firestore
+      final toRequestRef = _firestore
           .collection('users')
           .doc(toUid)
           .collection('friend_requests')
-          .doc(requestId)
-          .set({
+          .doc(requestId);
+      batch.set(toRequestRef, {
         'id': requestId,
         'fromUid': fromUid,
         'fromName': fromName,
@@ -302,12 +303,12 @@ class FriendService {
       });
 
       // Simpan di pengirim (untuk tracking)
-      await _firestore
+      final fromRequestRef = _firestore
           .collection('users')
           .doc(fromUid)
           .collection('sent_requests')
-          .doc(requestId)
-          .set({
+          .doc(requestId);
+      batch.set(fromRequestRef, {
         'id': requestId,
         'fromUid': fromUid,
         'fromName': fromName,
@@ -319,6 +320,7 @@ class FriendService {
         'sentAt': now,
       });
 
+      await batch.commit();
       return null; // Success
     } catch (e) {
       debugPrint('Error sending friend request: $e');
@@ -326,7 +328,7 @@ class FriendService {
     }
   }
 
-  /// Accept friend request
+  /// Accept friend request (uses batch for atomicity)
   static Future<bool> acceptFriendRequest({
     required String requestId,
     required String fromUid,
@@ -339,14 +341,15 @@ class FriendService {
   }) async {
     try {
       final now = Timestamp.now();
+      final batch = _firestore.batch();
 
       // Tambah ke friends user pertama
-      await _firestore
+      final fromFriendRef = _firestore
           .collection('users')
           .doc(fromUid)
           .collection('friends')
-          .doc(toUid)
-          .set({
+          .doc(toUid);
+      batch.set(fromFriendRef, {
         'uid': toUid,
         'displayName': toName,
         'username': toUsername,
@@ -354,12 +357,12 @@ class FriendService {
       });
 
       // Tambah ke friends user kedua
-      await _firestore
+      final toFriendRef = _firestore
           .collection('users')
           .doc(toUid)
           .collection('friends')
-          .doc(fromUid)
-          .set({
+          .doc(fromUid);
+      batch.set(toFriendRef, {
         'uid': fromUid,
         'displayName': fromName,
         'username': fromUsername,
@@ -367,26 +370,22 @@ class FriendService {
       });
 
       // Update status request
-      await _firestore
+      final toRequestRef = _firestore
           .collection('users')
           .doc(toUid)
           .collection('friend_requests')
-          .doc(requestId)
-          .update({'status': 'accepted'});
+          .doc(requestId);
+      batch.update(toRequestRef, {'status': 'accepted'});
 
-      // Hapus dari sent_requests pengirim
-      await _firestore
+      // Update sent_requests pengirim
+      final fromSentRef = _firestore
           .collection('users')
           .doc(fromUid)
           .collection('sent_requests')
-          .where('toUid', isEqualTo: toUid)
-          .get()
-          .then((snapshot) {
-        for (final doc in snapshot.docs) {
-          doc.reference.update({'status': 'accepted'});
-        }
-      });
+          .doc(requestId);
+      batch.update(fromSentRef, {'status': 'accepted'});
 
+      await batch.commit();
       return true;
     } catch (e) {
       debugPrint('Error accepting friend request: $e');
@@ -401,27 +400,25 @@ class FriendService {
     required String toUid,
   }) async {
     try {
+      final batch = _firestore.batch();
+
       // Update status request
-      await _firestore
+      final toRequestRef = _firestore
           .collection('users')
           .doc(toUid)
           .collection('friend_requests')
-          .doc(requestId)
-          .update({'status': 'rejected'});
+          .doc(requestId);
+      batch.update(toRequestRef, {'status': 'rejected'});
 
-      // Hapus dari sent_requests pengirim
-      await _firestore
+      // Delete from sent_requests pengirim
+      final fromSentRef = _firestore
           .collection('users')
           .doc(fromUid)
           .collection('sent_requests')
-          .where('toUid', isEqualTo: toUid)
-          .get()
-          .then((snapshot) {
-        for (final doc in snapshot.docs) {
-          doc.reference.delete();
-        }
-      });
+          .doc(requestId);
+      batch.delete(fromSentRef);
 
+      await batch.commit();
       return true;
     } catch (e) {
       debugPrint('Error rejecting friend request: $e');
@@ -429,28 +426,31 @@ class FriendService {
     }
   }
 
-  /// Remove friend
+  /// Remove friend (uses batch for atomicity)
   static Future<bool> removeFriend({
     required String uid,
     required String friendUid,
   }) async {
     try {
+      final batch = _firestore.batch();
+
       // Hapus dari friends user pertama
-      await _firestore
+      final userFriendRef = _firestore
           .collection('users')
           .doc(uid)
           .collection('friends')
-          .doc(friendUid)
-          .delete();
+          .doc(friendUid);
+      batch.delete(userFriendRef);
 
       // Hapus dari friends user kedua
-      await _firestore
+      final friendUserRef = _firestore
           .collection('users')
           .doc(friendUid)
           .collection('friends')
-          .doc(uid)
-          .delete();
+          .doc(uid);
+      batch.delete(friendUserRef);
 
+      await batch.commit();
       return true;
     } catch (e) {
       debugPrint('Error removing friend: $e');
@@ -487,6 +487,83 @@ class FriendService {
     } catch (e) {
       debugPrint('Error getting pending request count: $e');
       return 0;
+    }
+  }
+
+  /// Send nudge to a friend (like Duolingo)
+  static Future<bool> sendNudge({
+    required String fromUid,
+    required String fromName,
+    required String toUid,
+    required String toName,
+  }) async {
+    try {
+      final batch = _firestore.batch();
+
+      // Create nudge notification in recipient's collection
+      final nudgeRef = _firestore
+          .collection('users')
+          .doc(toUid)
+          .collection('nudges')
+          .doc();
+      batch.set(nudgeRef, {
+        'fromUid': fromUid,
+        'fromName': fromName,
+        'toUid': toUid,
+        'toName': toName,
+        'type': 'nudge',
+        'message': _getNudgeMessage(fromName),
+        'createdAt': Timestamp.now(),
+        'read': false,
+      });
+
+      await batch.commit();
+      return true;
+    } catch (e) {
+      debugPrint('Error sending nudge: $e');
+      return false;
+    }
+  }
+
+  static String _getNudgeMessage(String fromName) {
+    final messages = [
+      'Hey $fromName! Ayo latihan bareng! 💪',
+      '$fromName lagi ngejar kamu di leaderboard nih! 🏃',
+      'Ayo bangun dan latihan! $fromName lagi nunggu! ⏰',
+      'Kamu bisa lewatin $fromName! Coba latihan sekarang! 🎯',
+      'Hey! $fromName butuh partner latihan nih! 👊',
+    ];
+    return messages[DateTime.now().millisecond % messages.length];
+  }
+
+  /// Get pending nudges count
+  static Future<int> getPendingNudgesCount(String uid) async {
+    try {
+      final snapshot = await _firestore
+          .collection('users')
+          .doc(uid)
+          .collection('nudges')
+          .where('toUid', isEqualTo: uid)
+          .where('read', isEqualTo: false)
+          .get();
+      return snapshot.docs.length;
+    } catch (e) {
+      debugPrint('Error getting nudges count: $e');
+      return 0;
+    }
+  }
+
+  /// Mark nudge as read
+  static Future<void> markNudgeAsRead(String uid, String nudgeId) async {
+    try {
+      await _firestore
+          .collection('users')
+          .doc(uid)
+          .collection('nudges')
+          .doc(nudgeId)
+          .update({'read': true});
+    } catch (e) {
+      debugPrint('Error marking nudge as read: $e');
     }
   }
 }

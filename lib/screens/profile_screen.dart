@@ -479,60 +479,149 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   Future<void> _deleteAccount() async {
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: Colors.black87,
-        title: Text(
-          _currentLang == 'id' ? 'Hapus Akun?' : 'Delete Account?',
-          style: const TextStyle(color: Colors.white),
-        ),
-        content: Text(
-          _currentLang == 'id'
-              ? 'Semua data Anda akan dihapus permanen. Yakin?'
-              : 'All your data will be permanently deleted. Are you sure?',
-          style: const TextStyle(color: Colors.white70),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: Text(
-              _currentLang == 'id' ? 'Batal' : 'Cancel',
-              style: const TextStyle(color: Colors.grey),
-            ),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: Text(
-              _currentLang == 'id' ? 'Hapus' : 'Delete',
-              style: const TextStyle(color: Colors.redAccent),
-            ),
-          ),
-        ],
+  final confirm = await showDialog<bool>(
+    context: context,
+    builder: (context) => AlertDialog(
+      backgroundColor: Colors.black87,
+      title: Text(
+        _currentLang == 'id' ? 'Hapus Akun?' : 'Delete Account?',
+        style: const TextStyle(color: Colors.white),
       ),
-    );
-    if (confirm == true) {
-      try {
-        await _firestore.collection('users').doc(widget.uid).delete();
-        final user = FirebaseAuth.instance.currentUser;
-        if (user != null) await user.delete();
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(_currentLang == 'id' ? 'Akun berhasil dihapus' : 'Account deleted successfully')),
-        );
-        if (mounted) {
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(builder: (context) => const LoginScreen()),
-          );
-        }
-      } catch (e) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(_currentLang == 'id' ? 'Gagal hapus akun' : 'Failed to delete account')),
-        );
+      content: Text(
+        _currentLang == 'id'
+            ? 'Semua data Anda akan dihapus permanen. Yakin?'
+            : 'All your data will be permanently deleted. Are you sure?',
+        style: const TextStyle(color: Colors.white70),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context, false),
+          child: Text(_currentLang == 'id' ? 'Batal' : 'Cancel', style: const TextStyle(color: Colors.grey)),
+        ),
+        TextButton(
+          onPressed: () => Navigator.pop(context, true),
+          child: Text(_currentLang == 'id' ? 'Hapus' : 'Delete', style: const TextStyle(color: Colors.redAccent)),
+        ),
+      ],
+    ),
+  );
+
+  if (confirm != true) return;
+
+  setState(() => _isLoading = true);
+
+  try {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) {
+      throw Exception('No user logged in');
+    }
+
+    final uid = widget.uid;
+
+    // --- Hapus semua subkoleksi ---
+
+    // 1. Hapus quest_progress
+    final questProgressSnapshot = await _firestore
+        .collection('users')
+        .doc(uid)
+        .collection('quest_progress')
+        .get();
+    for (var doc in questProgressSnapshot.docs) {
+      await doc.reference.delete();
+    }
+
+    // 2. Hapus quest_history
+    final questHistorySnapshot = await _firestore
+        .collection('users')
+        .doc(uid)
+        .collection('quest_history')
+        .get();
+    for (var doc in questHistorySnapshot.docs) {
+      await doc.reference.delete();
+    }
+
+    // 3. Hapus data leaderboard entries (jika pakai subkoleksi per minggu)
+    // Jika leaderboard pakai collectionGroup, query berdasarkan uid
+    try {
+      final leaderboardSnapshot = await _firestore
+          .collectionGroup('entries')
+          .where('uid', isEqualTo: uid)
+          .get();
+      for (var doc in leaderboardSnapshot.docs) {
+        await doc.reference.delete();
+      }
+    } catch (e) {
+      // Jika tidak ada indeks atau collectionGroup tidak tersedia,
+      // alternatif: hapus langsung dari koleksi leaderboard (jika ada)
+      // Hapus semua dokumen di leaderboard yang memiliki field uid
+      final leaderboardDocs = await _firestore
+          .collection('leaderboard')
+          .where('uid', isEqualTo: uid)
+          .get();
+      for (var doc in leaderboardDocs.docs) {
+        await doc.reference.delete();
       }
     }
-  }
 
+    // 4. Hapus data friends
+    final friendsSnapshot = await _firestore
+        .collection('friends')
+        .doc(uid)
+        .collection('mutual')
+        .get();
+    for (var doc in friendsSnapshot.docs) {
+      await doc.reference.delete();
+    }
+    // Hapus dokumen friends utama
+    await _firestore.collection('friends').doc(uid).delete();
+
+    // 5. Hapus data lainnya (misal notification, dll)
+    // Bisa tambahkan jika ada koleksi lain
+
+    // 6. Hapus dokumen user utama
+    await _firestore.collection('users').doc(uid).delete();
+
+    // 7. Hapus akun Firebase Auth
+    await user.delete();
+
+    // 8. Sign out
+    await FirebaseAuth.instance.signOut();
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(_currentLang == 'id' ? '✅ Akun berhasil dihapus' : '✅ Account deleted successfully'),
+          backgroundColor: Colors.green,
+        ),
+      );
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (context) => const LoginScreen()),
+      );
+    }
+  } on FirebaseAuthException catch (e) {
+    String message = _currentLang == 'id' ? 'Gagal hapus akun: ' : 'Failed to delete account: ';
+    if (e.code == 'requires-recent-login') {
+      message += _currentLang == 'id'
+          ? 'Silakan logout dan login ulang, lalu coba lagi.'
+          : 'Please log out and log in again, then try again.';
+    } else {
+      message += e.message ?? '';
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), backgroundColor: Colors.red),
+    );
+  } catch (e) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(_currentLang == 'id' ? '❌ Gagal hapus akun: $e' : '❌ Failed to delete account: $e'),
+        backgroundColor: Colors.red,
+      ),
+    );
+  } finally {
+    if (mounted) setState(() => _isLoading = false);
+  }
+}
   bool get _isHealthDataComplete {
     return _heightCm != null && _heightCm! > 0 &&
            _weightKg != null && _weightKg! > 0 &&

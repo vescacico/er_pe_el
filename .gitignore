@@ -33,3 +33,7 @@ android/key.properties
 *.keystore
 
 build/
+
+android/.kotlin/
+
+.dart_tool/

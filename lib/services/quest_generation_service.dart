@@ -666,13 +666,22 @@ Rules:
     }
   }
 
-  /// Get quest progress untuk user
+  /// Get today's date string for quest progress scope
+  static String _getTodayDateString() {
+    final now = DateTime.now();
+    return '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+  }
+
+  /// Get quest progress untuk user (scoped per date)
   static Future<Map<String, QuestProgress>> getQuestProgress(String uid) async {
     try {
+      final today = _getTodayDateString();
       final snapshot = await _firestore
           .collection('users')
           .doc(uid)
           .collection('quest_progress')
+          .doc(today)
+          .collection('quests')
           .get();
 
       final progress = <String, QuestProgress>{};
@@ -685,7 +694,7 @@ Rules:
     }
   }
 
-  /// Update progress quest
+  /// Update progress quest (scoped per date)
   static Future<void> updateQuestProgress({
     required String uid,
     required String questId,
@@ -693,10 +702,13 @@ Rules:
     required bool isCompleted,
   }) async {
     try {
+      final today = _getTodayDateString();
       await _firestore
           .collection('users')
           .doc(uid)
           .collection('quest_progress')
+          .doc(today)
+          .collection('quests')
           .doc(questId)
           .set({
         'currentProgress': currentProgress,
@@ -766,6 +778,67 @@ Rules:
       });
     } catch (e) {
       debugPrint('Error adding quest to history: $e');
+    }
+  }
+
+  /// Complete quest with batched writes (optimized for performance)
+  static Future<void> completeQuest({
+    required String uid,
+    required String questId,
+    required String questName,
+    required int expReward,
+    required String exerciseType,
+    required int currentProgress,
+    required String source,
+  }) async {
+    try {
+      final batch = _firestore.batch();
+
+      // Add to exp history
+      final expHistoryRef = _firestore
+          .collection('users')
+          .doc(uid)
+          .collection('exp_history')
+          .doc();
+      batch.set(expHistoryRef, {
+        'amount': expReward,
+        'source': source,
+        'timestamp': FieldValue.serverTimestamp(),
+      });
+
+      // Add to quest history
+      final questHistoryRef = _firestore
+          .collection('users')
+          .doc(uid)
+          .collection('quest_history')
+          .doc();
+      batch.set(questHistoryRef, {
+        'questId': questId,
+        'questName': questName,
+        'expReward': expReward,
+        'exerciseType': exerciseType,
+        'completedAt': FieldValue.serverTimestamp(),
+      });
+
+      // Update quest progress (per-date scoped)
+      final today = _getTodayDateString();
+      final progressRef = _firestore
+          .collection('users')
+          .doc(uid)
+          .collection('quest_progress')
+          .doc(today)
+          .collection('quests')
+          .doc(questId);
+      batch.set(progressRef, {
+        'currentProgress': currentProgress,
+        'isCompleted': true,
+        'updatedAt': FieldValue.serverTimestamp(),
+        'expEarned': expReward,
+      }, SetOptions(merge: true));
+
+      await batch.commit();
+    } catch (e) {
+      debugPrint('Error completing quest: $e');
     }
   }
 }

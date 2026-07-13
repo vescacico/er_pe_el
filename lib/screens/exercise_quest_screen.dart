@@ -1,21 +1,22 @@
 import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'dart:async';
-import 'dart:math';
 import '../services/exercise_database.dart';
 import '../services/language_service.dart';
 import '../services/sound_service.dart';
 import '../services/quest_generation_service.dart';
+import 'focus_check_screen.dart';
 
 class ExerciseQuestScreen extends StatefulWidget {
   final String uid;
   final Exercise exercise;
   final int sets;
-  final int reps; // For static: duration in seconds, for reps: number of reps
+  final int reps;
   final int restSeconds;
   final int expReward;
   final String? questId;
   final VoidCallback onSuccess;
-  final bool isStaticExercise; // true for plank, wall sit, etc.
+  final bool isStaticExercise;
 
   const ExerciseQuestScreen({
     super.key,
@@ -31,575 +32,270 @@ class ExerciseQuestScreen extends StatefulWidget {
   });
 
   @override
-  State<ExerciseQuestScreen> createState() => _ExerciseQuestScreenState();
+  State<ExerciseQuestScreen> createState() => ExerciseQuestScreenState();
 }
 
-class _ExerciseQuestScreenState extends State<ExerciseQuestScreen> {
+class ExerciseQuestScreenState extends State<ExerciseQuestScreen> {
+  static const int _sessionTimeLimit = 180;
+
   int _currentSet = 0;
   int _currentReps = 0;
   bool _isResting = false;
   bool _isCompleted = false;
   bool _isCountingDown = false;
+  bool _exerciseStarted = false;
   int _countdown = 3;
+  int _sessionTimeLeft = _sessionTimeLimit;
+  int _holdTimeLeft = 0;
+  int _restTimeLeft = 0;
+  bool _finishedEarly = false;
+  bool _randomCheckActive = false;
+
   Timer? _timer;
-  Timer? _repTimer;
-  Timer? _countdownTimer;
-
-  // Random Check System
-  bool _isRandomCheckActive = false;
-  int _randomCheckTimeLeft = 5;
   Timer? _randomCheckTimer;
-  double _randomCheckX = 0;
-  double _randomCheckY = 0;
-  bool _randomCheckFailed = false;
-  int _randomChecksDone = 0; // Track how many random checks have occurred
-  static const int _maxRandomChecksPerSet = 2; // Max 2 random checks per set
-
-  // Time-based tracking
-  DateTime? _setStartTime;
-  final Random _random = Random();
-
-  // For static exercises (plank, etc.)
-  bool get _isStatic => widget.isStaticExercise ||
-      widget.exercise.category == 'core' &&
-      (widget.exercise.nameId.toLowerCase().contains('plank') ||
-       widget.exercise.nameId.toLowerCase().contains('wall sit'));
-
-  // Time limit based on exercise difficulty and type (in seconds)
-  int get _timeLimitForSet {
-    if (_isStatic) {
-      // For static exercises, time limit = hold duration + 30 seconds buffer
-      return widget.reps + 30;
-    }
-
-    // For rep-based exercises
-    final difficulty = widget.exercise.difficulty;
-    // Base time: ~6 seconds per rep for easier exercises, 8 for harder
-    final baseTimePerRep = difficulty == 'advanced' ? 8 : 6;
-    final baseTime = widget.reps * baseTimePerRep;
-
-    switch (difficulty) {
-      case 'beginner':
-        return baseTime + 90; // Extra time for beginners
-      case 'intermediate':
-        return baseTime + 60; // Extra time for intermediate
-      case 'advanced':
-        return baseTime + 30; // Less extra time for advanced
-      default:
-        return baseTime + 60;
-    }
-  }
-
-  // Random check interval - longer for static exercises, 1-2 checks per set max
-  int get _randomCheckIntervalSeconds {
-    if (_isStatic) {
-      // For plank/static: check at ~30s and ~45s marks (if holding that long)
-      return widget.reps ~/ 3; // Roughly divide the hold into 3 parts
-    }
-    // For dynamic exercises: shorter intervals, but still max 2 per set
-    if (widget.exercise.category == 'core') {
-      return 20; // 20 seconds for other core exercises
-    }
-    return 15; // 15 seconds for other exercises
-  }
-
-  String get _langCode => LanguageService.getCurrentLanguage();
+  Timer? _sessionTimer;
   final SoundService _sound = SoundService();
 
   @override
   void initState() {
     super.initState();
+    _holdTimeLeft = widget.reps;
+    _sessionTimeLeft = _sessionTimeLimit;
+    _isCountingDown = true;
     _startCountdown();
+    _scheduleRandomCheck();
+  }
+
+  // Start session timer that counts down
+  void _startSessionTimer() {
+    _sessionTimer?.cancel();
+    _sessionTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (_sessionTimeLeft > 0 && !_isResting && !_isCompleted) {
+        setState(() => _sessionTimeLeft--);
+      }
+      if (_sessionTimeLeft <= 0) {
+        timer.cancel();
+      }
+    });
   }
 
   void _startCountdown() {
-    setState(() => _isCountingDown = true);
-    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
       if (_countdown > 1) {
+        _sound.playCountdown();
         setState(() => _countdown--);
-        _sound.playCountdownTick();
       } else {
         timer.cancel();
         setState(() {
           _isCountingDown = false;
-          _currentSet = 1;
-          _isResting = false;
+          _exerciseStarted = true;
+          if (widget.isStaticExercise) {
+            _startHoldTimer();
+          }
         });
+        _startSessionTimer(); // Start session countdown
       }
     });
-  }
-
-  void _startExercise() {
-    _setStartTime = DateTime.now();
-    _currentReps = 0;
-    _randomChecksDone = 0;
-    _repTimer?.cancel();
-    _sound.resetTimerState();
-
-    if (_isStatic) {
-      _startStaticExercise();
-    } else {
-      _startRepBasedExercise();
-    }
-  }
-
-  void _startStaticExercise() {
-    // For plank/static: countdown the hold duration
-    int timeLeft = widget.reps; // widget.reps is duration in seconds for static
-    _repTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (!mounted) {
-        timer.cancel();
-        return;
-      }
-
-      timeLeft--;
-      setState(() {
-        _currentReps = widget.reps - timeLeft; // Show progress as reps completed
-      });
-
-      // Play timer sounds
-      _sound.playStaticHoldTick(timeLeft);
-
-      // Warning at specific times
-      if (timeLeft == 10) {
-        _sound.playWarning();
-      }
-
-      // Schedule random check (only 1-2 per set for static)
-      if (_randomChecksDone < _maxRandomChecksPerSet && timeLeft <= widget.reps - 15) {
-        _scheduleRandomCheck();
-      }
-
-      if (timeLeft <= 0) {
-        timer.cancel();
-        _completeStaticExercise();
-      }
-    });
-
-    // Schedule first random check after initial hold period
-    if (widget.reps > 20) {
-      Future.delayed(Duration(seconds: widget.reps ~/ 2), () {
-        if (mounted && !_isResting && !_isCompleted && _repTimer != null && _repTimer!.isActive) {
-          _scheduleRandomCheck();
-        }
-      });
-    }
-  }
-
-  void _startRepBasedExercise() {
-    // For rep-based: countdown the time limit
-    int timeLeft = _timeLimitForSet;
-    _repTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (!mounted) {
-        timer.cancel();
-        return;
-      }
-
-      timeLeft--;
-
-      // Play timer sounds
-      _sound.playTimerTick(timeLeft);
-
-      // Warning at 10 seconds
-      if (timeLeft == 10) {
-        _sound.playWarning();
-      }
-
-      setState(() {});
-
-      // Schedule random check (1-2 per set)
-      if (_randomChecksDone < _maxRandomChecksPerSet) {
-        _scheduleRandomCheck();
-      }
-
-      if (timeLeft <= 0) {
-        // Time's up! Count how many reps done manually
-        timer.cancel();
-        _showManualRepInput();
-      }
-    });
-
-    // Trigger first random check after some time
-    _scheduleRandomCheck();
-  }
-
-  void _completeStaticExercise() {
-    _repTimer?.cancel();
-    _sound.playSetComplete();
-    if (_currentSet < widget.sets) {
-      setState(() {
-        _isResting = true;
-      });
-      _sound.playRestStart();
-      _startRestTimer();
-    } else {
-      _completeExercise();
-    }
   }
 
   void _scheduleRandomCheck() {
-    if (_isCompleted || _isResting) return;
-    if (_randomChecksDone >= _maxRandomChecksPerSet) return;
+    final delay = 15 + (DateTime.now().millisecond % 31);
+    _randomCheckTimer = Timer(Duration(seconds: delay), _triggerRandomCheck);
+  }
 
-    int delay = _randomCheckIntervalSeconds + _random.nextInt(10) - 5;
-    delay = delay.clamp(8, _randomCheckIntervalSeconds + 15);
-
-    Future.delayed(Duration(seconds: delay), () {
-      if (mounted && !_isResting && !_isCompleted &&
-          _repTimer != null && _randomChecksDone < _maxRandomChecksPerSet) {
-        _triggerRandomCheck();
+  void _startHoldTimer() {
+    _timer?.cancel();
+    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (_holdTimeLeft > 1) {
+        setState(() => _holdTimeLeft--);
+      } else {
+        timer.cancel();
+        _completeSet();
       }
     });
+  }
+
+  void _startRestTimer() {
+    // Calculate rest time based on exercise difficulty: 5-45 seconds
+    // Use exercise difficulty or fall back to quest difficulty
+    int restDuration;
+    final exerciseDifficulty = widget.exercise.difficulty.toLowerCase();
+
+    if (exerciseDifficulty.contains('beginner') || exerciseDifficulty == 'easy') {
+      restDuration = 8; // 8 seconds for easy/beginner
+    } else if (exerciseDifficulty.contains('intermediate') || exerciseDifficulty == 'medium') {
+      restDuration = 15; // 15 seconds for medium
+    } else if (exerciseDifficulty == 'hard' || exerciseDifficulty.contains('advanced')) {
+      restDuration = 25; // 25 seconds for hard
+    } else if (exerciseDifficulty.contains('expert')) {
+      restDuration = 40; // 40 seconds for expert
+    } else {
+      // Fall back to widget.restSeconds but clamp between 5-45
+      restDuration = widget.restSeconds.clamp(5, 45);
+    }
+
+    _restTimeLeft = restDuration;
+    setState(() => _isResting = true);
+
+    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (_restTimeLeft > 1) {
+        _sound.playTick();
+        setState(() => _restTimeLeft--);
+      } else {
+        timer.cancel();
+        _sound.playRestStart();
+        _startNextSet();
+      }
+    });
+  }
+
+  // Skip rest and continue immediately
+  void _skipRest() {
+    _timer?.cancel();
+    setState(() => _restTimeLeft = 0);
+    _sound.playSuccess();
+    _startNextSet();
   }
 
   void _triggerRandomCheck() {
     if (_isResting || _isCompleted) return;
-    if (_randomChecksDone >= _maxRandomChecksPerSet) return;
-
-    _randomChecksDone++;
-
-    // Random position for the check button
-    _randomCheckX = (_random.nextDouble() * 0.6) - 0.3;
-    _randomCheckY = (_random.nextDouble() * 0.4) - 0.2;
-
-    setState(() {
-      _isRandomCheckActive = true;
-      _randomCheckTimeLeft = 5;
-    });
-
-    _sound.playRandomCheckAlert();
-
-    _randomCheckTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (!mounted) {
-        timer.cancel();
-        return;
-      }
-
-      setState(() {
-        _randomCheckTimeLeft--;
-      });
-
-      if (_randomCheckTimeLeft <= 0) {
-        timer.cancel();
-        _failRandomCheck();
-      }
-    });
+    _showFocusCheck();
   }
 
-  void _successRandomCheck() {
-    _randomCheckTimer?.cancel();
-    _sound.playSuccess();
-    setState(() {
-      _isRandomCheckActive = false;
-    });
-    // Don't schedule more random checks for this set (already done 1-2)
+  Future<void> _showFocusCheck() async {
+    final result = await FocusCheckScreen.show(context);
+    if (result == null || !result) {
+      _failRandomCheck();
+    }
   }
 
   void _failRandomCheck() {
-    _randomCheckTimer?.cancel();
     _sound.playWarning();
-    setState(() {
-      _isRandomCheckActive = false;
-      _randomCheckFailed = true;
-    });
-
-    // Show fail dialog
-    _showRandomCheckFailDialog();
+    setState(() => _randomCheckActive = false);
+    _showFailDialog();
   }
 
-  void _showRandomCheckFailDialog() {
+  void _showFailDialog() {
+    final lang = LanguageService.getCurrentLanguage();
     showDialog(
       context: context,
       barrierDismissible: false,
-      builder: (context) => AlertDialog(
+      builder: (ctx) => AlertDialog(
         backgroundColor: Colors.black87,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(16),
-          side: const BorderSide(color: Colors.red, width: 2),
+          side: const BorderSide(color: Colors.red),
         ),
         title: Row(
           children: [
-            const Icon(Icons.error_outline, color: Colors.red),
+            const Icon(Icons.error, color: Colors.red),
             const SizedBox(width: 8),
-            Text(
-              _langCode == 'id' ? 'GAGAL!' : 'FAILED!',
-              style: const TextStyle(color: Colors.red),
-            ),
+            Text(lang == 'id' ? 'Gagal!' : 'Failed!', style: const TextStyle(color: Colors.red)),
           ],
         ),
         content: Text(
-          _langCode == 'id'
-              ? 'Kamu tidak fokus! Quest gagal.'
-              : 'You were not focused! Quest failed.',
+          lang == 'id' ? 'Kamu tidak fokus saat exercise!' : 'You were not focused during exercise!',
           style: const TextStyle(color: Colors.white),
         ),
         actions: [
           TextButton(
             onPressed: () {
+              Navigator.pop(ctx);
               Navigator.pop(context);
-              Navigator.pop(context); // Exit quest
             },
-            child: Text(
-              _langCode == 'id' ? 'Keluar' : 'Exit',
-              style: const TextStyle(color: Colors.red),
-            ),
+            child: Text(lang == 'id' ? 'Keluar' : 'Exit', style: const TextStyle(color: Colors.red)),
           ),
-          ElevatedButton(
-            onPressed: () {
-              Navigator.pop(context);
-              // Retry current set
-              setState(() => _randomCheckFailed = false);
-              _startExercise();
-            },
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
-            child: Text(
-              _langCode == 'id' ? 'Coba Lagi' : 'Retry',
-              style: const TextStyle(color: Colors.white),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _showManualRepInput() {
-    _repTimer?.cancel();
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        backgroundColor: Colors.black87,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(16),
-          side: const BorderSide(color: Colors.orange, width: 2),
-        ),
-        title: Row(
-          children: [
-            const Icon(Icons.timer, color: Colors.orange),
-            const SizedBox(width: 8),
-            Text(
-              _langCode == 'id' ? 'Waktu Habis!' : 'Time\'s Up!',
-              style: const TextStyle(color: Colors.orange),
-            ),
-          ],
-        ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              _langCode == 'id'
-                  ? 'Berapa repetisi yang sudah kamu lakukan?'
-                  : 'How many repetitions did you complete?',
-              style: const TextStyle(color: Colors.white),
-            ),
-            const SizedBox(height: 16),
-            _RepInputSelector(
-              maxReps: widget.reps,
-              onSelected: (reps) {
-                Navigator.pop(context);
-                setState(() => _currentReps = reps);
-                _onRepCountComplete();
-              },
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  void _onRepCountComplete() {
-    if (_currentReps >= widget.reps) {
-      // Full completion
-      _sound.playSuccess();
-      _completeSet();
-    } else if (_currentReps >= widget.reps * 0.5) {
-      // Partial completion - count as set but with penalty note
-      _sound.playBeep();
-      _showPartialCompletion();
-    } else {
-      // Too few reps - fail
-      _sound.playWarning();
-      _showLowRepsDialog();
-    }
-  }
-
-  void _showPartialCompletion() {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        backgroundColor: Colors.black87,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(16),
-          side: const BorderSide(color: Colors.amber, width: 2),
-        ),
-        title: Row(
-          children: [
-            const Icon(Icons.info_outline, color: Colors.amber),
-            const SizedBox(width: 8),
-            Text(
-              _langCode == 'id' ? 'Set Tidak Lengkap' : 'Incomplete Set',
-              style: const TextStyle(color: Colors.amber),
-            ),
-          ],
-        ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              _langCode == 'id'
-                  ? 'Kamu melakukan $_currentReps dari ${widget.reps} repetisi.'
-                  : 'You completed $_currentReps of ${widget.reps} reps.',
-              style: const TextStyle(color: Colors.white),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              _langCode == 'id'
-                  ? 'Set tetap dihitung, tapi fokus untuk menyelesaikan semuanya!'
-                  : 'Set is still counted, but focus to complete all next time!',
-              style: const TextStyle(color: Colors.grey, fontSize: 12),
-            ),
-          ],
-        ),
-        actions: [
-          ElevatedButton(
-            onPressed: () {
-              Navigator.pop(context);
-              _completeSet();
-            },
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.amber),
-            child: Text(
-              _langCode == 'id' ? 'Lanjut' : 'Continue',
-              style: const TextStyle(color: Colors.black),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _showLowRepsDialog() {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        backgroundColor: Colors.black87,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(16),
-          side: const BorderSide(color: Colors.red, width: 2),
-        ),
-        title: Row(
-          children: [
-            const Icon(Icons.thumb_down, color: Colors.red),
-            const SizedBox(width: 8),
-            Text(
-              _langCode == 'id' ? 'Terlalu Sedikit!' : 'Too Few!',
-              style: const TextStyle(color: Colors.red),
-            ),
-          ],
-        ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              _langCode == 'id'
-                  ? 'Minimal harus完成 ${(widget.reps * 0.5).ceil()} repetisi!'
-                  : 'You need to complete at least ${(widget.reps * 0.5).ceil()} reps!',
-              style: const TextStyle(color: Colors.white),
-            ),
-            const SizedBox(height: 16),
-            ElevatedButton(
-              onPressed: () {
-                Navigator.pop(context);
-                _startExercise();
-              },
-              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-              child: Text(
-                _langCode == 'id' ? 'Coba Lagi' : 'Try Again',
-                style: const TextStyle(color: Colors.white),
-              ),
-            ),
-          ],
-        ),
-        actions: [
           TextButton(
             onPressed: () {
-              Navigator.pop(context);
-              Navigator.pop(context);
+              Navigator.pop(ctx);
+              _resetExercise();
             },
-            child: Text(
-              _langCode == 'id' ? 'Keluar' : 'Exit',
-              style: const TextStyle(color: Colors.grey),
-            ),
+            child: Text(lang == 'id' ? 'Coba Lagi' : 'Retry', style: const TextStyle(color: Color(0xFF10B981))),
           ),
         ],
       ),
     );
+  }
+
+  void _resetExercise() {
+    setState(() {
+      _currentSet = 0;
+      _currentReps = 0;
+      _holdTimeLeft = widget.reps;
+      _sessionTimeLeft = _sessionTimeLimit;
+      _isResting = false;
+      _randomCheckActive = false;
+      _finishedEarly = false;
+      _isCountingDown = true;
+      _exerciseStarted = false;
+      _countdown = 3;
+    });
+    _startCountdown();
+    _scheduleRandomCheck();
+  }
+
+  void _incrementReps() {
+    if (_currentReps < widget.reps) {
+      _sound.playRepComplete();
+      setState(() {
+        _currentReps++;
+        if (_currentReps >= widget.reps) {
+          _finishedEarly = true;
+        }
+      });
+      if (_currentReps >= widget.reps) {
+        _completeSet();
+      }
+    }
   }
 
   void _completeSet() {
-    _repTimer?.cancel();
+    _timer?.cancel();
     _sound.playSetComplete();
-    if (_currentSet < widget.sets) {
-      setState(() {
-        _isResting = true;
-        _currentReps = 0;
-      });
-      _sound.playRestStart();
-      _startRestTimer();
-    } else {
+    if (_currentSet + 1 >= widget.sets) {
       _completeExercise();
+    } else {
+      setState(() {
+        _currentSet++;
+        _currentReps = 0;
+        _holdTimeLeft = widget.reps;
+      });
+      _startRestTimer();
     }
   }
 
-  void _startRestTimer() {
-    int restTime = widget.restSeconds;
-    _timer?.cancel();
-    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (restTime > 1) {
-        setState(() => restTime--);
-        // Warning beep at 5 seconds
-        if (restTime == 5) {
-          _sound.playWarning();
-        } else {
-          _sound.playTick();
-        }
-      } else {
-        timer.cancel();
-        setState(() {
-          _isResting = false;
-          _currentSet++;
-        });
-        _sound.playBeep();
-      }
+  void _startNextSet() {
+    setState(() {
+      _isResting = false;
+      _currentReps = 0;
+      _holdTimeLeft = widget.reps;
     });
+    if (widget.isStaticExercise) {
+      _startHoldTimer();
+    }
   }
 
   void _completeExercise() {
-    _sound.playCompletion();
     setState(() => _isCompleted = true);
-    _showCompletionDialog();
-  }
+    _timer?.cancel();
+    _randomCheckTimer?.cancel();
+    _sound.playCompletion();
 
-  void _showCompletionDialog() {
+    final lang = LanguageService.getCurrentLanguage();
     showDialog(
       context: context,
       barrierDismissible: false,
-      builder: (context) => AlertDialog(
+      builder: (ctx) => AlertDialog(
         backgroundColor: Colors.black87,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(16),
-          side: const BorderSide(color: Color(0xFF10B981), width: 2),
+          side: const BorderSide(color: Color(0xFF10B981)),
         ),
         title: Row(
           children: [
             const Icon(Icons.celebration, color: Color(0xFF10B981)),
             const SizedBox(width: 8),
-            Text(
-              t('quest_clear'),
-              style: const TextStyle(color: Color(0xFF10B981), fontWeight: FontWeight.bold),
-            ),
+            Text(lang == 'id' ? 'Selesai!' : 'Completed!', style: const TextStyle(color: Color(0xFF10B981))),
           ],
         ),
         content: Column(
@@ -607,65 +303,45 @@ class _ExerciseQuestScreenState extends State<ExerciseQuestScreen> {
           children: [
             Text(
               '+${widget.expReward} EXP',
-              style: const TextStyle(
-                color: Color(0xFF10B981),
-                fontSize: 32,
-                fontWeight: FontWeight.bold,
+              style: const TextStyle(color: Color(0xFF10B981), fontSize: 32, fontWeight: FontWeight.bold),
+            ),
+            if (_finishedEarly) ...[
+              const SizedBox(height: 8),
+              Text(
+                lang == 'id' ? 'Selesai lebih awal!' : 'Finished early!',
+                style: const TextStyle(color: Colors.amber),
               ),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              t('all_sets_completed'),
-              style: const TextStyle(color: Colors.white70),
-              textAlign: TextAlign.center,
-            ),
+            ],
           ],
         ),
         actions: [
           TextButton(
             onPressed: () async {
-              // Save quest to history
               await QuestGenerationService.addQuestToHistory(
                 uid: widget.uid,
                 questId: widget.questId ?? widget.exercise.id,
-                questName: widget.exercise.getName(_langCode),
+                questName: widget.exercise.getName(lang),
                 expReward: widget.expReward,
                 exerciseType: widget.exercise.category,
               );
-
-              // Also add to EXP history
               await QuestGenerationService.addExpToHistory(
                 uid: widget.uid,
                 amount: widget.expReward,
-                source: widget.exercise.getName(_langCode),
+                source: widget.exercise.getName(lang),
               );
-
-              Navigator.pop(context);
+              if (ctx.mounted) Navigator.pop(ctx);
               widget.onSuccess();
               Navigator.pop(context);
             },
-            child: Text(
-              t('claim_exp'),
-              style: const TextStyle(color: Color(0xFF10B981), fontWeight: FontWeight.bold),
-            ),
+            child: Text(lang == 'id' ? 'Klaim EXP' : 'Claim EXP', style: const TextStyle(color: Color(0xFF10B981), fontWeight: FontWeight.bold)),
           ),
         ],
       ),
     );
   }
 
-  void _skipRest() {
-    _timer?.cancel();
-    _sound.playBeep();
-    setState(() {
-      _isResting = false;
-      _currentSet++;
-    });
-  }
-
   void _quitQuest() {
     _timer?.cancel();
-    _repTimer?.cancel();
     _randomCheckTimer?.cancel();
     Navigator.pop(context);
   }
@@ -673,165 +349,152 @@ class _ExerciseQuestScreenState extends State<ExerciseQuestScreen> {
   @override
   void dispose() {
     _timer?.cancel();
-    _repTimer?.cancel();
-    _countdownTimer?.cancel();
     _randomCheckTimer?.cancel();
+    _sessionTimer?.cancel();
     super.dispose();
-  }
-
-  int get _remainingTime {
-    if (_repTimer == null || _setStartTime == null) return _timeLimitForSet;
-    final elapsed = DateTime.now().difference(_setStartTime!).inSeconds;
-    return (_timeLimitForSet - elapsed).clamp(0, _timeLimitForSet);
-  }
-
-  int get _staticTimeRemaining {
-    // For static exercises, calculate remaining hold time
-    if (_repTimer == null || _setStartTime == null) return widget.reps;
-    final elapsed = DateTime.now().difference(_setStartTime!).inSeconds;
-    return (widget.reps - elapsed).clamp(0, widget.reps);
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_isCountingDown) {
-      return _buildCountdownScreen();
-    }
-
-    if (_isResting) {
-      return _buildRestScreen();
-    }
-
-    if (_isCompleted) {
-      return _buildCompletedScreen();
-    }
-
+    if (_isCountingDown) return _buildCountdownScreen();
+    if (_isResting) return _buildRestScreen();
+    if (_isCompleted) return _buildCompletedScreen();
     return _buildExerciseScreen();
   }
 
   Widget _buildCountdownScreen() {
+    final lang = LanguageService.getCurrentLanguage();
+    final name = widget.exercise.getName(lang);
     return Scaffold(
       backgroundColor: Colors.black,
-      body: Stack(
-        children: [
-          Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Text(
-                  t('exercise_in_progress'),
-                  style: const TextStyle(color: Colors.white70, fontSize: 16),
-                ),
-                const SizedBox(height: 20),
-                Text(
-                  widget.exercise.getName(_langCode),
-                  style: const TextStyle(
-                    color: Color(0xFF10B981),
-                    fontSize: 28,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const SizedBox(height: 40),
-                Container(
-                  width: 120,
-                  height: 120,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    border: Border.all(color: Color(0xFF10B981), width: 4),
-                  ),
-                  child: Center(
-                    child: Text(
-                      '$_countdown',
-                      style: const TextStyle(
-                        color: Color(0xFF10B981),
-                        fontSize: 64,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 40),
-                Text(
-                  t('countdown'),
-                  style: const TextStyle(color: Colors.white54),
-                ),
-              ],
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Text(
+              lang == 'id' ? 'Latihan dalam progres' : 'Exercise in progress',
+              style: const TextStyle(color: Colors.white70, fontSize: 16),
             ),
-          ),
-        ],
+            const SizedBox(height: 20),
+            Text(
+              name,
+              style: const TextStyle(color: Color(0xFF10B981), fontSize: 28, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 40),
+            Container(
+              width: 150,
+              height: 150,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                border: Border.all(color: const Color(0xFF10B981), width: 4),
+              ),
+              child: Center(
+                child: Text(
+                  '$_countdown',
+                  style: const TextStyle(color: Color(0xFF10B981), fontSize: 72, fontWeight: FontWeight.bold),
+                ),
+              ),
+            ),
+            const SizedBox(height: 20),
+            Text(
+              widget.isStaticExercise
+                  ? (lang == 'id' ? 'Bersiaplah menahan!' : 'Get Ready to Hold!')
+                  : (lang == 'id' ? 'Bersiaplah!' : 'Get Ready!'),
+              style: const TextStyle(color: Colors.white54, fontSize: 14),
+            ),
+          ],
+        ),
       ),
     );
   }
 
   Widget _buildRestScreen() {
-    int restTime = widget.restSeconds;
+    // Calculate actual rest duration for progress display
+    int restDuration;
+    final exerciseDifficulty = widget.exercise.difficulty.toLowerCase();
+
+    if (exerciseDifficulty.contains('beginner') || exerciseDifficulty == 'easy') {
+      restDuration = 8;
+    } else if (exerciseDifficulty.contains('intermediate') || exerciseDifficulty == 'medium') {
+      restDuration = 15;
+    } else if (exerciseDifficulty == 'hard' || exerciseDifficulty.contains('advanced')) {
+      restDuration = 25;
+    } else if (exerciseDifficulty.contains('expert')) {
+      restDuration = 40;
+    } else {
+      restDuration = widget.restSeconds.clamp(5, 45);
+    }
+
+    final progress = restDuration > 0 ? (_restTimeLeft / restDuration) : 0.0;
+    final isCritical = _restTimeLeft <= 3;
+    final lang = LanguageService.getCurrentLanguage();
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
         backgroundColor: Colors.black,
         elevation: 0,
-        title: Text(
-          widget.exercise.getName(_langCode),
-          style: const TextStyle(fontWeight: FontWeight.bold),
-        ),
-        leading: IconButton(
-          icon: const Icon(Icons.close, color: Colors.white),
-          onPressed: _quitQuest,
-        ),
+        automaticallyImplyLeading: false,
       ),
       body: Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const Icon(Icons.pause_circle, size: 80, color: Colors.amber),
-            const SizedBox(height: 20),
-            Text(
-              'Set ${_currentSet}/${widget.sets} ${t('done')}',
-              style: const TextStyle(color: Colors.white70, fontSize: 16),
-            ),
-            const SizedBox(height: 40),
-            StreamBuilder<int>(
-              stream: Stream.periodic(const Duration(seconds: 1), (i) => restTime - i),
-              builder: (context, snapshot) {
-                final remaining = (snapshot.data ?? restTime).clamp(0, restTime);
-                return Container(
-                  width: 150,
-                  height: 150,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    border: Border.all(
-                      color: remaining <= 5 ? Colors.red : Colors.amber,
-                      width: 4,
+            const Text('REST', style: TextStyle(color: Colors.white54, fontSize: 24, letterSpacing: 4)),
+            const SizedBox(height: 30),
+            Container(
+              width: 180,
+              height: 180,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                border: Border.all(color: isCritical ? Colors.red : Colors.amber, width: 4),
+              ),
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  SizedBox(
+                    width: 170,
+                    height: 170,
+                    child: CircularProgressIndicator(
+                      value: progress,
+                      strokeWidth: 8,
+                      backgroundColor: Colors.white10,
+                      color: isCritical ? Colors.red : Colors.amber,
                     ),
                   ),
-                  child: Center(
-                    child: Text(
-                      '${remaining}s',
-                      style: TextStyle(
-                        color: remaining <= 5 ? Colors.red : Colors.amber,
-                        fontSize: 48,
-                        fontWeight: FontWeight.bold,
-                      ),
+                  Text(
+                    '$_restTimeLeft',
+                    style: TextStyle(
+                      color: isCritical ? Colors.red : Colors.amber,
+                      fontSize: 56,
+                      fontWeight: FontWeight.bold,
                     ),
                   ),
-                );
-              },
+                ],
+              ),
             ),
             const SizedBox(height: 30),
             Text(
-              t('rest_between_sets'),
-              style: const TextStyle(color: Colors.white54, fontSize: 14),
+              lang == 'id' ? 'Set selanjutnya' : 'Next set',
+              style: const TextStyle(color: Colors.white54, fontSize: 16),
+            ),
+            Text(
+              '${_currentSet + 1}/${widget.sets}',
+              style: const TextStyle(color: Color(0xFF10B981), fontSize: 20, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 40),
-            ElevatedButton(
+            // Skip rest button
+            TextButton(
               onPressed: _skipRest,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.amber,
-                padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 12),
-              ),
-              child: Text(
-                'Skip Rest',
-                style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 12),
+                decoration: BoxDecoration(
+                  border: Border.all(color: const Color(0xFF10B981)),
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: Text(
+                  lang == 'id' ? 'LEWATI REST >' : 'SKIP REST >',
+                  style: const TextStyle(color: Color(0xFF10B981), fontSize: 16, fontWeight: FontWeight.bold),
+                ),
               ),
             ),
           ],
@@ -847,24 +510,16 @@ class _ExerciseQuestScreenState extends State<ExerciseQuestScreen> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const Icon(Icons.celebration, size: 100, color: Color(0xFF10B981)),
+            const Icon(Icons.check_circle, color: Color(0xFF10B981), size: 100),
             const SizedBox(height: 20),
             Text(
-              t('quest_clear'),
-              style: const TextStyle(
-                color: Color(0xFF10B981),
-                fontSize: 32,
-                fontWeight: FontWeight.bold,
-              ),
+              LanguageService.getCurrentLanguage() == 'id' ? 'Selesai!' : 'Completed!',
+              style: const TextStyle(color: Colors.white, fontSize: 28, fontWeight: FontWeight.bold),
             ),
-            const SizedBox(height: 20),
+            const SizedBox(height: 10),
             Text(
               '+${widget.expReward} EXP',
-              style: const TextStyle(
-                color: Color(0xFF10B981),
-                fontSize: 48,
-                fontWeight: FontWeight.bold,
-              ),
+              style: const TextStyle(color: Color(0xFF10B981), fontSize: 36, fontWeight: FontWeight.bold),
             ),
           ],
         ),
@@ -873,82 +528,100 @@ class _ExerciseQuestScreenState extends State<ExerciseQuestScreen> {
   }
 
   Widget _buildExerciseScreen() {
-    final instructions = widget.exercise.getInstructions(_langCode);
-    final tips = widget.exercise.getTips(_langCode);
+    final lang = LanguageService.getCurrentLanguage();
+    final progress = _sessionTimeLimit > 0 ? (_sessionTimeLeft / _sessionTimeLimit) : 0.0;
+    final isWarning = _sessionTimeLeft <= 30;
+    final isCritical = _sessionTimeLeft <= 10;
+    final instructions = widget.exercise.getInstructions(lang);
+    final tips = widget.exercise.getTips(lang);
+    final name = widget.exercise.getName(lang);
 
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
         backgroundColor: Colors.black,
         elevation: 0,
-        title: Text(
-          widget.exercise.getName(_langCode),
-          style: const TextStyle(fontWeight: FontWeight.bold),
-        ),
-        leading: IconButton(
-          icon: const Icon(Icons.close, color: Colors.white),
-          onPressed: _quitQuest,
-        ),
-        actions: [
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            margin: const EdgeInsets.only(right: 12),
-            decoration: BoxDecoration(
-              color: Color(0xFF10B981).withValues(alpha: 0.2),
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: Text(
-              _isStatic
-                  ? '${widget.sets} ${t('sets')} × ${widget.reps}s'
-                  : '${widget.sets} ${t('sets')} × ${widget.reps} ${t('reps')}',
-              style: const TextStyle(
-                color: Color(0xFF10B981),
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ),
-        ],
+        title: Text(name, style: const TextStyle(fontWeight: FontWeight.bold)),
+        leading: IconButton(icon: const Icon(Icons.close, color: Colors.white), onPressed: _quitQuest),
       ),
       body: Stack(
         children: [
           Column(
             children: [
-              // Progress indicator
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                padding: const EdgeInsets.all(12),
                 color: const Color(0xFF111111),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                child: Column(
                   children: [
-                    Text(
-                      '${t('sets')}: $_currentSet / ${widget.sets}',
-                      style: const TextStyle(color: Colors.white70),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(
+                              Icons.timer,
+                              color: isCritical ? Colors.red : (isWarning ? Colors.orange : Colors.amber),
+                              size: 20,
+                            ),
+                            const SizedBox(width: 8),
+                            Text(
+                              lang == 'id' ? 'Sisa Waktu' : 'Time Left',
+                              style: const TextStyle(color: Colors.white70, fontSize: 12),
+                            ),
+                          ],
+                        ),
+                        Text(
+                          _formatTime(_sessionTimeLeft),
+                          style: TextStyle(
+                            color: isCritical ? Colors.red : (isWarning ? Colors.orange : Colors.amber),
+                            fontWeight: FontWeight.bold,
+                            fontSize: 16,
+                          ),
+                        ),
+                      ],
                     ),
-                    // Time / Rep counter
-                    if (_isStatic)
-                      _buildStaticTimerDisplay()
-                    else
-                      _buildRepTimerDisplay(),
+                    const SizedBox(height: 4),
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(4),
+                      child: LinearProgressIndicator(
+                        value: progress,
+                        minHeight: 6,
+                        backgroundColor: Colors.white10,
+                        color: isCritical ? Colors.red : (isWarning ? Colors.orange : Colors.amber),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text('Set: $_currentSet / ${widget.sets}', style: const TextStyle(color: Colors.white70, fontSize: 12)),
+                        if (_exerciseStarted && !widget.isStaticExercise)
+                          Text(
+                            lang == 'id' ? 'Tap untuk repetisi' : 'Tap to count reps',
+                            style: const TextStyle(color: Colors.grey, fontSize: 10),
+                          ),
+                      ],
+                    ),
                   ],
                 ),
               ),
-
               Expanded(
                 child: SingleChildScrollView(
                   padding: const EdgeInsets.all(20),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      // Exercise visualization with image from musclewiki
                       _buildExerciseImageSection(),
                       const SizedBox(height: 20),
-
-                      // Target display card
                       _buildTargetCard(),
-                      const SizedBox(height: 20),
+                      const SizedBox(height: 16),
 
-                      // Start button (only show before starting)
-                      if (_repTimer == null || !_repTimer!.isActive)
+                      // Quick Guide Panel - User friendly guide
+                      _buildQuickGuidePanel(),
+
+                      const SizedBox(height: 16),
+
+                      if (!_exerciseStarted)
                         SizedBox(
                           width: double.infinity,
                           child: ElevatedButton(
@@ -956,105 +629,63 @@ class _ExerciseQuestScreenState extends State<ExerciseQuestScreen> {
                             style: ElevatedButton.styleFrom(
                               backgroundColor: const Color(0xFF10B981),
                               padding: const EdgeInsets.symmetric(vertical: 16),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(12),
-                              ),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                             ),
                             child: Text(
-                              _langCode == 'id' ? 'MULAI' : 'START',
-                              style: const TextStyle(
-                                color: Colors.black,
-                                fontSize: 18,
-                                fontWeight: FontWeight.bold,
-                                letterSpacing: 2,
-                              ),
+                              lang == 'id' ? 'MULAI' : 'START',
+                              style: const TextStyle(color: Colors.black, fontSize: 18, fontWeight: FontWeight.bold, letterSpacing: 2),
                             ),
                           ),
                         ),
-
+                      if (_exerciseStarted && !widget.isStaticExercise && !_isResting) _buildTapArea(),
                       const SizedBox(height: 24),
-
-                      // Instructions
-                      _buildSectionTitle(t('instructions')),
-                      const SizedBox(height: 12),
-                      ...instructions.asMap().entries.map((entry) {
-                        return _buildInstructionItem(entry.key + 1, entry.value);
-                      }),
-
-                      const SizedBox(height: 24),
-
-                      // Tips
-                      _buildSectionTitle(t('tips')),
-                      const SizedBox(height: 12),
-                      Container(
-                        padding: const EdgeInsets.all(16),
-                        decoration: BoxDecoration(
-                          color: Colors.amber.withValues(alpha: 0.1),
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: Colors.amber.withValues(alpha: 0.3)),
-                        ),
-                        child: Column(
-                          children: tips.map((tip) {
-                            return Padding(
-                              padding: const EdgeInsets.only(bottom: 8),
-                              child: Row(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  const Icon(Icons.lightbulb_outline, color: Colors.amber, size: 20),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: Text(tip, style: const TextStyle(color: Colors.amber, fontSize: 14)),
-                                  ),
-                                ],
-                              ),
-                            );
-                          }).toList(),
-                        ),
+                      Text(
+                        lang == 'id' ? 'Instruksi' : 'Instructions',
+                        style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
                       ),
+                      const SizedBox(height: 12),
+                      for (int i = 0; i < instructions.length; i++)
+                        _buildInstructionItem(i + 1, instructions[i]),
+                      const SizedBox(height: 24),
+                      Text(
+                        lang == 'id' ? 'Tips' : 'Tips',
+                        style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+                      ),
+                      const SizedBox(height: 12),
+                      _buildTipsSection(tips),
                     ],
                   ),
                 ),
               ),
             ],
           ),
-
-          // Random Check Overlay
-          if (_isRandomCheckActive)
-            Positioned(
-              left: MediaQuery.of(context).size.width * (0.2 + _randomCheckX),
-              top: MediaQuery.of(context).size.height * (0.3 + _randomCheckY),
+          if (_randomCheckActive)
+            Positioned.fill(
               child: GestureDetector(
-                onTap: _successRandomCheck,
+                onTap: () {
+                  _randomCheckTimer?.cancel();
+                  setState(() => _randomCheckActive = false);
+                  _sound.playSuccess();
+                },
                 child: Container(
-                  padding: const EdgeInsets.all(20),
-                  decoration: const BoxDecoration(
-                    color: Colors.red,
-                    shape: BoxShape.circle,
-                    boxShadow: [
-                      BoxShadow(color: Colors.red, blurRadius: 20, spreadRadius: 5),
-                    ],
-                  ),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Icon(Icons.touch_app, color: Colors.white, size: 40),
-                      Text(
-                        '$_randomCheckTimeLeft',
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 24,
-                          fontWeight: FontWeight.bold,
-                        ),
+                  color: Colors.black.withOpacity(0.7),
+                  child: Center(
+                    child: Container(
+                      padding: const EdgeInsets.all(32),
+                      decoration: const BoxDecoration(
+                        color: Colors.red,
+                        shape: BoxShape.circle,
+                        boxShadow: [BoxShadow(color: Colors.red, blurRadius: 30, spreadRadius: 10)],
                       ),
-                      Text(
-                        _langCode == 'id' ? 'TAP!' : 'TAP!',
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                        ),
+                      child: const Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.touch_app, color: Colors.white, size: 50),
+                          SizedBox(height: 8),
+                          Text('TAP!', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+                        ],
                       ),
-                    ],
+                    ),
                   ),
                 ),
               ),
@@ -1064,63 +695,120 @@ class _ExerciseQuestScreenState extends State<ExerciseQuestScreen> {
     );
   }
 
-  Widget _buildStaticTimerDisplay() {
-    final timeRemaining = _staticTimeRemaining;
-    final progress = 1 - (timeRemaining / widget.reps);
-    final isWarning = timeRemaining <= 10;
+  void _startExercise() {
+    setState(() {
+      _exerciseStarted = true;
+      if (widget.isStaticExercise) {
+        _startHoldTimer();
+      }
+    });
+  }
 
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-      decoration: BoxDecoration(
-        color: isWarning ? Colors.red : const Color(0xFF10B981),
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(
-            Icons.timer,
-            color: isWarning ? Colors.white : Colors.black,
-            size: 16,
-          ),
-          const SizedBox(width: 4),
-          Text(
-            '${timeRemaining}s',
-            style: TextStyle(
-              color: isWarning ? Colors.white : Colors.black,
-              fontWeight: FontWeight.bold,
+  Widget _buildTapArea() {
+    final lang = LanguageService.getCurrentLanguage();
+    return GestureDetector(
+      onTap: _incrementReps,
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(vertical: 24),
+        margin: const EdgeInsets.only(bottom: 16),
+        decoration: BoxDecoration(
+          color: const Color(0xFF10B981).withValues(alpha: 0.1),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: const Color(0xFF10B981).withValues(alpha: 0.3)),
+        ),
+        child: Column(
+          children: [
+            const Icon(Icons.touch_app, color: Color(0xFF10B981), size: 48),
+            const SizedBox(height: 8),
+            Text(
+              lang == 'id' ? 'TAP untuk repetisi' : 'TAP for reps',
+              style: const TextStyle(color: Color(0xFF10B981), fontSize: 16, fontWeight: FontWeight.bold),
             ),
-          ),
-        ],
+            const SizedBox(height: 4),
+            Text(
+              '$_currentReps / ${widget.reps}',
+              style: const TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold),
+            ),
+            if (_finishedEarly) ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                decoration: BoxDecoration(
+                  color: Colors.amber.withValues(alpha: 0.2),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.flash_on, color: Colors.amber, size: 16),
+                    const SizedBox(width: 4),
+                    Text(
+                      lang == 'id' ? 'Cepat!' : 'Fast!',
+                      style: const TextStyle(color: Colors.amber, fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }
 
-  Widget _buildRepTimerDisplay() {
-    final timeLeft = _remainingTime;
-    final isWarning = timeLeft <= 10;
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-      decoration: BoxDecoration(
-        color: isWarning ? Colors.red : Colors.amber,
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(
-            Icons.timer,
-            color: isWarning ? Colors.white : Colors.black,
-            size: 16,
+  Widget _buildTargetCard() {
+    final lang = LanguageService.getCurrentLanguage();
+    if (widget.isStaticExercise) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(30),
+        decoration: BoxDecoration(
+          color: const Color(0xFF111111),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: _holdTimeLeft <= 10 ? Colors.red.withValues(alpha: 0.5) : Colors.transparent,
           ),
-          const SizedBox(width: 4),
-          Text(
-            '${timeLeft}s',
-            style: TextStyle(
-              color: isWarning ? Colors.white : Colors.black,
-              fontWeight: FontWeight.bold,
+        ),
+        child: Column(
+          children: [
+            Text(
+              'HOLD',
+              style: const TextStyle(color: Colors.grey, fontSize: 16, letterSpacing: 2),
             ),
+            const SizedBox(height: 10),
+            Text(
+              _exerciseStarted ? '${_holdTimeLeft}s' : '${widget.reps}s',
+              style: const TextStyle(color: Colors.white, fontSize: 48, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '${lang == 'id' ? 'Tahan selama ' : 'Hold for '}${widget.reps}${lang == 'id' ? ' detik' : ' seconds'}',
+              style: const TextStyle(color: Colors.grey, fontSize: 12),
+            ),
+          ],
+        ),
+      );
+    }
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(30),
+      decoration: BoxDecoration(color: const Color(0xFF111111), borderRadius: BorderRadius.circular(16)),
+      child: Column(
+        children: [
+          Text(
+            _exerciseStarted ? '$_currentReps / ${widget.reps}' : '${widget.reps}',
+            style: const TextStyle(color: Colors.white, fontSize: 48, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            '${widget.sets} ${lang == 'id' ? 'Set' : 'Sets'} x ${widget.reps} ${lang == 'id' ? 'Rep' : 'Reps'}',
+            style: const TextStyle(color: Colors.grey, fontSize: 14),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            lang == 'id' ? 'Tap untuk menghitung repetisi' : 'Tap to count repetitions',
+            style: const TextStyle(color: Colors.amber, fontSize: 12),
           ),
         ],
       ),
@@ -1129,253 +817,84 @@ class _ExerciseQuestScreenState extends State<ExerciseQuestScreen> {
 
   Widget _buildExerciseImageSection() {
     final images = ExerciseDatabase.getExerciseImages(widget.exercise.id);
+    if (images == null) return _buildIconPlaceholder();
 
-    if (images != null) {
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // Starting position
-          if (images['start'] != null) ...[
-            Text(
-              _langCode == 'id' ? 'Posisi Awal' : 'Starting Position',
-              style: const TextStyle(color: Colors.white70, fontSize: 12),
+    final lang = LanguageService.getCurrentLanguage();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (images['start'] != null) ...[
+          Text(
+            lang == 'id' ? 'Posisi Awal' : 'Starting Position',
+            style: const TextStyle(color: Colors.white70, fontSize: 12),
+          ),
+          const SizedBox(height: 8),
+          Container(
+            width: double.infinity,
+            height: 150,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: widget.exercise.color.withValues(alpha: 0.3)),
             ),
-            const SizedBox(height: 8),
-            Container(
-              width: double.infinity,
-              height: 150,
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: widget.exercise.color.withValues(alpha: 0.3)),
-              ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(12),
-                child: Image.network(
-                  images['start']!,
-                  fit: BoxFit.cover,
-                  loadingBuilder: (context, child, loadingProgress) {
-                    if (loadingProgress == null) return child;
-                    return Center(
-                      child: CircularProgressIndicator(
-                        color: widget.exercise.color,
-                        value: loadingProgress.expectedTotalBytes != null
-                            ? loadingProgress.cumulativeBytesLoaded / loadingProgress.expectedTotalBytes!
-                            : null,
-                      ),
-                    );
-                  },
-                  errorBuilder: (_, __, ___) => _buildExerciseIconPlaceholder(),
-                ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: CachedNetworkImage(
+                imageUrl: images['start']!,
+                fit: BoxFit.cover,
+                placeholder: (context, url) => _buildIconPlaceholder(),
+                errorWidget: (context, url, error) => _buildIconPlaceholder(),
               ),
             ),
-          ],
-          const SizedBox(height: 16),
-          // Ending position
-          if (images['end'] != null) ...[
-            Text(
-              _langCode == 'id' ? 'Posisi Akhir' : 'Ending Position',
-              style: const TextStyle(color: Colors.white70, fontSize: 12),
-            ),
-            const SizedBox(height: 8),
-            Container(
-              width: double.infinity,
-              height: 150,
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: widget.exercise.color.withValues(alpha: 0.3)),
-              ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(12),
-                child: Image.network(
-                  images['end']!,
-                  fit: BoxFit.cover,
-                  loadingBuilder: (context, child, loadingProgress) {
-                    if (loadingProgress == null) return child;
-                    return Center(
-                      child: CircularProgressIndicator(
-                        color: widget.exercise.color,
-                        value: loadingProgress.expectedTotalBytes != null
-                            ? loadingProgress.cumulativeBytesLoaded / loadingProgress.expectedTotalBytes!
-                            : null,
-                      ),
-                    );
-                  },
-                  errorBuilder: (_, __, ___) => _buildExerciseIconPlaceholder(),
-                ),
-              ),
-            ),
-          ],
+          ),
         ],
-      );
-    }
-
-    return _buildExerciseIconPlaceholder();
+        if (images['end'] != null) ...[
+          const SizedBox(height: 16),
+          Text(
+            lang == 'id' ? 'Posisi Akhir' : 'Ending Position',
+            style: const TextStyle(color: Colors.white70, fontSize: 12),
+          ),
+          const SizedBox(height: 8),
+          Container(
+            width: double.infinity,
+            height: 150,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: widget.exercise.color.withValues(alpha: 0.3)),
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: CachedNetworkImage(
+                imageUrl: images['end']!,
+                fit: BoxFit.cover,
+                placeholder: (context, url) => _buildIconPlaceholder(),
+                errorWidget: (context, url, error) => _buildIconPlaceholder(),
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
   }
 
-  Widget _buildTargetCard() {
-    if (_isStatic) {
-      // For static exercises like plank
-      final timeRemaining = _staticTimeRemaining;
-      final progress = 1 - (timeRemaining / widget.reps);
-
-      return Container(
-        width: double.infinity,
-        padding: const EdgeInsets.all(30),
-        decoration: BoxDecoration(
-          color: const Color(0xFF111111),
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(
-            color: timeRemaining <= 10 ? Colors.red.withValues(alpha: 0.5) : Colors.transparent,
-          ),
-        ),
-        child: Column(
-          children: [
-            Text(
-              _langCode == 'id' ? 'HOLD' : 'HOLD',
-              style: const TextStyle(
-                color: Colors.grey,
-                fontSize: 16,
-                letterSpacing: 2,
-              ),
-            ),
-            const SizedBox(height: 10),
-            Text(
-              '${widget.reps}s',
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 48,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 16),
-            // Progress bar
-            ClipRRect(
-              borderRadius: BorderRadius.circular(10),
-              child: LinearProgressIndicator(
-                value: progress,
-                minHeight: 10,
-                backgroundColor: Colors.white10,
-                color: const Color(0xFF10B981),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              _langCode == 'id'
-                  ? 'Tahan selama ${widget.reps} detik'
-                  : 'Hold for ${widget.reps} seconds',
-              style: const TextStyle(color: Colors.grey, fontSize: 12),
-            ),
-          ],
-        ),
-      );
-    } else {
-      // For rep-based exercises
-      final timeLeft = _remainingTime;
-
-      return Container(
-        width: double.infinity,
-        padding: const EdgeInsets.all(30),
-        decoration: BoxDecoration(
-          color: const Color(0xFF111111),
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(
-            color: timeLeft <= 10 ? Colors.red.withValues(alpha: 0.5) : Colors.transparent,
-          ),
-        ),
-        child: Column(
-          children: [
-            Text(
-              'TARGET REPS',
-              style: const TextStyle(
-                color: Colors.grey,
-                fontSize: 16,
-                letterSpacing: 2,
-              ),
-            ),
-            const SizedBox(height: 10),
-            Text(
-              '${widget.reps} reps',
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 36,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              _langCode == 'id'
-                  ? 'Waktu tersisa: ${timeLeft}s'
-                  : 'Time remaining: ${timeLeft}s',
-              style: const TextStyle(color: Colors.grey, fontSize: 12),
-            ),
-          ],
-        ),
-      );
-    }
-  }
-
-  Widget _buildExerciseIconPlaceholder() {
+  Widget _buildIconPlaceholder() {
     return Container(
       width: double.infinity,
       height: 200,
       decoration: BoxDecoration(
         color: widget.exercise.color.withValues(alpha: 0.2),
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-          color: widget.exercise.color.withValues(alpha: 0.5),
-        ),
+        border: Border.all(color: widget.exercise.color.withValues(alpha: 0.5)),
       ),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(
-            widget.exercise.icon,
-            size: 80,
-            color: widget.exercise.color,
-          ),
+          Icon(widget.exercise.icon, size: 80, color: widget.exercise.color),
           const SizedBox(height: 10),
           Text(
-            widget.exercise.getName(_langCode),
-            style: TextStyle(
-              color: widget.exercise.color,
-              fontSize: 24,
-              fontWeight: FontWeight.bold,
-            ),
+            widget.exercise.getName(LanguageService.getCurrentLanguage()),
+            style: TextStyle(color: widget.exercise.color, fontSize: 24, fontWeight: FontWeight.bold),
           ),
         ],
-      ),
-    );
-  }
-
-  Widget _buildExerciseIcon() {
-    return Column(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        Icon(
-          widget.exercise.icon,
-          size: 80,
-          color: widget.exercise.color,
-        ),
-        const SizedBox(height: 10),
-        Text(
-          widget.exercise.getName(_langCode),
-          style: TextStyle(
-            color: widget.exercise.color,
-            fontSize: 24,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildSectionTitle(String title) {
-    return Text(
-      title,
-      style: const TextStyle(
-        color: Colors.white,
-        fontSize: 18,
-        fontWeight: FontWeight.bold,
       ),
     );
   }
@@ -1396,60 +915,210 @@ class _ExerciseQuestScreenState extends State<ExerciseQuestScreen> {
             child: Center(
               child: Text(
                 '$number',
-                style: TextStyle(
-                  color: widget.exercise.color,
-                  fontWeight: FontWeight.bold,
-                ),
+                style: TextStyle(color: widget.exercise.color, fontWeight: FontWeight.bold),
               ),
             ),
           ),
           const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              text,
-              style: const TextStyle(
-                color: Colors.white70,
-                fontSize: 14,
-                height: 1.4,
-              ),
-            ),
-          ),
+          Expanded(child: Text(text, style: const TextStyle(color: Colors.white70, fontSize: 14, height: 1.4))),
         ],
       ),
     );
   }
-}
 
-/// Widget untuk input manual jumlah repetisi
-class _RepInputSelector extends StatelessWidget {
-  final int maxReps;
-  final Function(int) onSelected;
-
-  const _RepInputSelector({required this.maxReps, required this.onSelected});
-
-  @override
-  Widget build(BuildContext context) {
-    return Wrap(
-      spacing: 8,
-      runSpacing: 8,
-      alignment: WrapAlignment.center,
-      children: List.generate(maxReps + 1, (i) {
-        final isTarget = i == maxReps;
-        return ElevatedButton(
-          onPressed: () => onSelected(i),
-          style: ElevatedButton.styleFrom(
-            backgroundColor: isTarget ? Colors.green : Colors.grey[800],
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+  Widget _buildTipsSection(List<String> tips) {
+    if (tips.isEmpty) {
+      return Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: Colors.amber.withValues(alpha: 0.1),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.amber.withValues(alpha: 0.3)),
+        ),
+        child: Text(
+          LanguageService.getCurrentLanguage() == 'id' ? 'Tidak ada tips tersedia' : 'No tips available',
+          style: const TextStyle(color: Colors.amber, fontSize: 14),
+        ),
+      );
+    }
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.amber.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.amber.withValues(alpha: 0.3)),
+      ),
+      child: Column(
+        children: tips.map((tip) => Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Icon(Icons.lightbulb_outline, color: Colors.amber, size: 20),
+              const SizedBox(width: 8),
+              Expanded(child: Text(tip, style: const TextStyle(color: Colors.amber, fontSize: 14))),
+            ],
           ),
-          child: Text(
-            '$i',
-            style: TextStyle(
-              color: isTarget ? Colors.white : Colors.grey[400],
-              fontWeight: isTarget ? FontWeight.bold : FontWeight.normal,
-            ),
-          ),
-        );
-      }),
+        )).toList(),
+      ),
     );
+  }
+
+  // Quick Guide Panel - User friendly guide for exercise
+  Widget _buildQuickGuidePanel() {
+    final lang = LanguageService.getCurrentLanguage();
+    final isId = lang == 'id';
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [
+            const Color(0xFF10B981).withOpacity(0.15),
+            const Color(0xFF111111),
+          ],
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+        ),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xFF10B981).withOpacity(0.3)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF10B981).withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Icon(Icons.help_outline, color: Color(0xFF10B981), size: 20),
+              ),
+              const SizedBox(width: 12),
+              Text(
+                isId ? 'Panduan Singkat' : 'Quick Guide',
+                style: const TextStyle(
+                  color: Color(0xFF10B981),
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+
+          // Step-by-step guide
+          if (!_exerciseStarted) ...[
+            _buildGuideStep(
+              icon: Icons.touch_app,
+              color: Colors.blue,
+              title: isId ? '1. Tekan MULAI' : '1. Press START',
+              description: isId ? 'Untuk mulai exercise' : 'To start exercise',
+            ),
+            const SizedBox(height: 12),
+            _buildGuideStep(
+              icon: Icons.repeat,
+              color: Colors.orange,
+              title: isId ? '2. Tap Layar' : '2. Tap Screen',
+              description: isId
+                  ? 'Tap layar untuk menghitung repetisi'
+                  : 'Tap screen to count repetitions',
+            ),
+            const SizedBox(height: 12),
+            _buildGuideStep(
+              icon: Icons.timer,
+              color: Colors.amber,
+              title: isId ? '3. Istirahat' : '3. Rest',
+              description: isId
+                  ? 'Istirahat sebentar antar set'
+                  : 'Rest briefly between sets',
+            ),
+            const SizedBox(height: 12),
+            _buildGuideStep(
+              icon: Icons.flag,
+              color: Colors.green,
+              title: isId ? '4. Selesaikan!' : '4. Complete!',
+              description: isId
+                  ? 'Kumpulkan semua set untuk klaim EXP'
+                  : 'Complete all sets to claim EXP',
+            ),
+          ] else ...[
+            _buildGuideStep(
+              icon: Icons.touch_app,
+              color: const Color(0xFF10B981),
+              title: isId ? '✓ Tap Layar!' : '✓ Tap Screen!',
+              description: isId
+                  ? 'Tap untuk menghitung repetisi $_currentReps/${widget.reps}'
+                  : 'Tap to count reps $_currentReps/${widget.reps}',
+              isActive: true,
+            ),
+            const SizedBox(height: 12),
+            _buildGuideStep(
+              icon: Icons.repeat,
+              color: Colors.grey,
+              title: isId
+                  ? 'Set ${_currentSet + 1}/${widget.sets}'
+                  : 'Set ${_currentSet + 1}/${widget.sets}',
+              description: isId
+                  ? 'Selesaikan ${widget.reps} repetisi per set'
+                  : 'Complete ${widget.reps} reps per set',
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildGuideStep({
+    required IconData icon,
+    required Color color,
+    required String title,
+    required String description,
+    bool isActive = false,
+  }) {
+    return Row(
+      children: [
+        Container(
+          width: 36,
+          height: 36,
+          decoration: BoxDecoration(
+            color: isActive ? color : color.withOpacity(0.2),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Icon(icon, color: isActive ? Colors.white : color, size: 20),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title,
+                style: TextStyle(
+                  color: isActive ? color : Colors.white,
+                  fontSize: 14,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              Text(
+                description,
+                style: TextStyle(
+                  color: isActive ? color.withOpacity(0.8) : Colors.grey,
+                  fontSize: 12,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  String _formatTime(int seconds) {
+    final minutes = seconds ~/ 60;
+    final secs = seconds % 60;
+    return '${minutes.toString().padLeft(2, '0')}:${secs.toString().padLeft(2, '0')}';
   }
 }

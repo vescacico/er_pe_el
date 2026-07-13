@@ -4,10 +4,16 @@ import 'package:flutter/material.dart';
 import '../main.dart' show HomeScreen;
 import '../services/language_service.dart';
 import '../services/sick_mode_service.dart';
+import '../services/user_profile_service.dart';
+import '../services/avatar_service.dart';
+import '../widgets/avatar_preview.dart';
 import 'history_screen.dart';
 import 'leaderboard_screen.dart';
 import 'profile_screen.dart';
 import 'sick_mode_screen.dart';
+import 'avatar_screen.dart';
+import 'achievement_screen.dart';
+import 'fitness_chatbot_screen.dart';
 
 class MainNavScreen extends StatefulWidget {
   final String uid;
@@ -25,6 +31,14 @@ class _MainNavScreenState extends State<MainNavScreen> {
   String? _photoUrl;
   String? _username;
   bool _isSickModeActive = false;
+  UserAvatar? _userAvatar;
+
+  // User stats for Achievement screen
+  int _userLevel = 1;
+  int _userExp = 0;
+  int _userStreak = 0;
+  int _questsCompleted = 0;
+  int _friendsCount = 0;
 
   late final List<Widget> _tabs;
 
@@ -42,16 +56,68 @@ class _MainNavScreenState extends State<MainNavScreen> {
       ),
     ];
     _loadProfileData();
+    _loadAvatarData();
     _checkSickMode();
   }
 
   Future<void> _loadProfileData() async {
-    final doc = await FirebaseFirestore.instance.collection('users').doc(widget.uid).get();
-    if (mounted && doc.exists) {
-      setState(() {
-        _photoUrl = doc.data()?['photoUrl'] as String?;
-        _username = doc.data()?['username'] as String?;
-      });
+    try {
+      final doc = await FirebaseFirestore.instance.collection('users').doc(widget.uid).get();
+      if (mounted && doc.exists) {
+        final data = doc.data()!;
+        setState(() {
+          _photoUrl = data['photoUrl'] as String?;
+          _username = data['username'] as String?;
+          _userLevel = data['level'] ?? 1;
+          _userExp = data['totalExp'] ?? 0;
+          _userStreak = data['streak'] ?? 0;
+        });
+      }
+    } catch (e) {
+      debugPrint('Error loading profile: $e');
+    }
+  }
+
+  Future<void> _loadAvatarData() async {
+    try {
+      final doc = await FirebaseFirestore.instance
+          .collection('users')
+          .doc(widget.uid)
+          .collection('avatar')
+          .doc('current')
+          .get();
+
+      if (mounted && doc.exists && doc.data() != null) {
+        setState(() {
+          _userAvatar = UserAvatar.fromMap(widget.uid, doc.data()!);
+        });
+      }
+    } catch (e) {
+      debugPrint('Error loading avatar: $e');
+    }
+  }
+
+  Future<void> _loadUserStats() async {
+    try {
+      // Load quest completion count
+      final questHistory = await FirebaseFirestore.instance
+          .collection('users')
+          .doc(widget.uid)
+          .collection('quest_history')
+          .get();
+      _questsCompleted = questHistory.size;
+
+      // Load friends count
+      final friends = await FirebaseFirestore.instance
+          .collection('users')
+          .doc(widget.uid)
+          .collection('friends')
+          .get();
+      _friendsCount = friends.size;
+
+      if (mounted) setState(() {});
+    } catch (e) {
+      debugPrint('Error loading stats: $e');
     }
   }
 
@@ -93,6 +159,45 @@ class _MainNavScreenState extends State<MainNavScreen> {
     });
   }
 
+  void _openAvatar() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => AvatarScreen(
+          uid: widget.uid,
+          userLevel: _userLevel,
+          userExp: _userExp,
+        ),
+      ),
+    ).then((_) {
+      _loadAvatarData(); // Refresh avatar after changes
+    });
+  }
+
+  void _openAchievements() async {
+    // Load stats first
+    await _loadUserStats();
+
+    if (!mounted) return;
+
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => AchievementScreen(
+          uid: widget.uid,
+          userLevel: _userLevel,
+          userExp: _userExp,
+          userStreak: _userStreak,
+          questsCompleted: _questsCompleted,
+          friendsCount: _friendsCount,
+          walkingQuests: 0, // Will be loaded in AchievementScreen
+          hydrationQuests: 0,
+          exerciseQuests: 0,
+        ),
+      ),
+    );
+  }
+
   void _openSickMode() {
     Navigator.push(
       context,
@@ -102,6 +207,15 @@ class _MainNavScreenState extends State<MainNavScreen> {
     ).then((_) {
       _checkSickMode();
     });
+  }
+
+  void _openFitnessChatbot() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => FitnessChatbotScreen(uid: widget.uid),
+      ),
+    );
   }
 
   @override
@@ -115,17 +229,45 @@ class _MainNavScreenState extends State<MainNavScreen> {
           padding: const EdgeInsets.all(8.0),
           child: GestureDetector(
             onTap: _openProfile,
-            child: CircleAvatar(
-              backgroundColor: const Color(0xFF10B981).withOpacity(0.2),
-              backgroundImage: _photoUrl != null ? NetworkImage(_photoUrl!) : null,
-              child: _photoUrl == null
-                  ? const Icon(Icons.person, color: Color(0xFF10B981))
-                  : null,
-            ),
+            child: _userAvatar != null
+                ? AvatarPreview(
+                    avatar: _userAvatar!,
+                    size: 40,
+                    showAura: false,
+                    animate: false,
+                  )
+                : CircleAvatar(
+                    backgroundColor: const Color(0xFF10B981).withOpacity(0.2),
+                    backgroundImage: _photoUrl != null ? NetworkImage(_photoUrl!) : null,
+                    child: _photoUrl == null
+                        ? const Icon(Icons.person, color: Color(0xFF10B981))
+                        : null,
+                  ),
           ),
         ),
         title: Text(_title, style: const TextStyle(fontWeight: FontWeight.bold)),
         actions: [
+          // Fitness Chatbot Button
+          IconButton(
+            onPressed: _openFitnessChatbot,
+            icon: const Icon(Icons.chat_bubble, color: Color(0xFF10B981)),
+            tooltip: _currentLang == 'id' ? 'Asisten Kebugaran' : 'Fitness Assistant',
+          ),
+
+          // Achievement Button
+          IconButton(
+            onPressed: _openAchievements,
+            icon: const Icon(Icons.emoji_events, color: Colors.amber),
+            tooltip: _currentLang == 'id' ? 'Achievement' : 'Achievements',
+          ),
+
+          // Avatar Button
+          IconButton(
+            onPressed: _openAvatar,
+            icon: const Icon(Icons.face, color: Color(0xFF10B981)),
+            tooltip: _currentLang == 'id' ? 'Avatar' : 'Avatar',
+          ),
+
           // Sick Mode Button
           GestureDetector(
             onTap: _openSickMode,

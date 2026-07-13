@@ -1,0 +1,140 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ========== HELPER FUNCTIONS ==========
+
+    // Check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Get current user ID
+    function uid() {
+      return request.auth.uid;
+    }
+
+    // Check if user is accessing their own document
+    function isOwner(userId) {
+      return isAuthenticated() && uid() == userId;
+    }
+
+    // ========== USERS COLLECTION ==========
+
+    match /users/{userId} {
+      // Anyone can read basic public profile (displayName, level, rank, etc.)
+      allow read: if isAuthenticated();
+
+      // Only owner can read private fields
+      allow get: if isOwner(userId);
+
+      // Only owner can update their profile
+      // IMPORTANT: EXP, level, rank can ONLY be modified by Cloud Functions
+      // Client can update other fields but not these protected ones
+      allow update: if isOwner(userId)
+                    && !request.resource.data.diff(resource.data).affectedKeys()
+                         .hasAny(['totalExp', 'level', 'rank', 'currentExp', 'expToNextLevel']);
+
+      // User document is created by admin/cloud function or signup flow
+      allow create: if isOwner(userId);
+
+      // User cannot delete their account via client (admin action only)
+      allow delete: if false;
+    }
+
+    // ========== USER PROGRESS (protected - EXP/level/rank) ==========
+
+    match /users/{userId}/progress/{docId} {
+      // Only owner can read/write their progress
+      allow read, write: if isOwner(userId);
+    }
+
+    // ========== QUEST PROGRESS (per-date scoped) ==========
+
+    match /users/{userId}/quest_progress/{date}/{questId} {
+      // Only owner can access their quest progress
+      allow read, write: if isOwner(userId);
+    }
+
+    // ========== EXP HISTORY ==========
+
+    match /users/{userId}/exp_history/{docId} {
+      // Only owner can read their EXP history
+      allow read: if isOwner(userId);
+
+      // Only Cloud Functions should create exp history entries
+      // For client-side, we allow create but with validation
+      allow create: if isOwner(userId)
+                    && request.resource.data.keys().hasAll(['amount', 'source', 'timestamp'])
+                    && request.resource.data.amount is int
+                    && request.resource.data.amount > 0
+                    && request.resource.data.amount <= 1000; // Max single entry
+    }
+
+    // ========== QUEST HISTORY ==========
+
+    match /users/{userId}/quest_history/{docId} {
+      // Only owner can read their quest history
+      allow read: if isOwner(userId);
+
+      // Only owner can create quest history entries
+      allow create: if isOwner(userId)
+                    && request.resource.data.keys().hasAll(['questId', 'questName', 'expReward', 'exerciseType', 'completedAt']);
+    }
+
+    // ========== ACHIEVEMENTS ==========
+
+    match /users/{userId}/achievements/{docId} {
+      // Only owner can access their achievements
+      allow read, write: if isOwner(userId);
+    }
+
+    // ========== AVATAR ==========
+
+    match /users/{userId}/avatar/{docId} {
+      // Only owner can access their avatar
+      allow read: if isAuthenticated(); // Others can see avatar
+      allow write: if isOwner(userId);
+    }
+
+    // ========== FRIENDS ==========
+
+    match /users/{userId}/friends/{friendId} {
+      // Only owner can manage their friends list
+      allow read, write: if isOwner(userId);
+    }
+
+    match /friend_requests/{requestId} {
+      // Sender can read and update their sent requests
+      allow read: if isAuthenticated() && request.resource.data.senderId == uid();
+      allow create: if isAuthenticated() && request.resource.data.senderId == uid();
+      allow update: if isAuthenticated() &&
+                    (request.resource.data.senderId == uid() || request.resource.data.recipientId == uid());
+      allow delete: if isAuthenticated() &&
+                    (request.resource.data.senderId == uid() || request.resource.data.recipientId == uid());
+    }
+
+    // ========== LEADERBOARD (public read) ==========
+
+    match /leaderboard/{docId} {
+      // Public read for leaderboard rankings
+      allow read: if isAuthenticated();
+
+      // Only Cloud Functions should update leaderboard
+      allow write: if false;
+    }
+
+    // ========== SICK MODE ==========
+
+    match /users/{userId}/sick_mode/{docId} {
+      // Only owner can manage sick mode
+      allow read, write: if isOwner(userId);
+    }
+
+    // ========== DEFAULT DENY ==========
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

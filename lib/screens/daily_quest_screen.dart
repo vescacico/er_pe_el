@@ -5,6 +5,7 @@ import '../services/user_profile_service.dart';
 import '../services/quest_generation_service.dart';
 import '../services/language_service.dart';
 import '../services/exercise_database.dart';
+import '../services/achievement_service.dart';
 import '../quest_walk.dart';
 import 'exercise_quest_screen.dart';
 import 'exercise_detail_screen.dart';
@@ -15,6 +16,7 @@ class DailyQuestScreen extends StatefulWidget {
   final UserProfileData profile;
   final VoidCallback onQuestComplete;
   final Function(int) onExpEarned;
+  final bool isSickModeActive; // Pass sick mode status from parent
 
   const DailyQuestScreen({
     super.key,
@@ -22,6 +24,7 @@ class DailyQuestScreen extends StatefulWidget {
     required this.profile,
     required this.onQuestComplete,
     required this.onExpEarned,
+    this.isSickModeActive = false,
   });
 
   @override
@@ -176,9 +179,9 @@ class _DailyQuestScreenState extends State<DailyQuestScreen> with SingleTickerPr
   }
 
   void _onQuestPressed(DailyQuest quest) {
-    // Cek rest mode
-    if (_restModeActive) {
-      _showRestModeWarning();
+    // Check sick mode only
+    if (widget.isSickModeActive) {
+      _showSickModeWarning();
       return;
     }
 
@@ -198,6 +201,44 @@ class _DailyQuestScreenState extends State<DailyQuestScreen> with SingleTickerPr
         _startExerciseQuest(quest);
         break;
     }
+  }
+
+  void _showSickModeWarning() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: Colors.black87,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+          side: const BorderSide(color: Colors.orange),
+        ),
+        title: Row(
+          children: [
+            const Icon(Icons.medical_services, color: Colors.orange),
+            const SizedBox(width: 8),
+            Text(
+              _currentLang == 'id' ? 'Mode Terbatas Aktif' : 'Limited Mode Active',
+              style: const TextStyle(color: Colors.orange),
+            ),
+          ],
+        ),
+        content: Text(
+          _currentLang == 'id'
+              ? 'Quest dikunci karena Mode Terbatas aktif.\n\nQuest telah disesuaikan dengan kondisi kesehatanmu.\n\nJika ingin menjalankan quest normal, nonaktifkan Mode Terbatas terlebih dahulu.'
+              : 'Quests are locked because Limited Mode is active.\n\nQuests have been adjusted to your health condition.\n\nIf you want to do normal quests, deactivate Limited Mode first.',
+          style: const TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: Text(
+              _currentLang == 'id' ? 'OK' : 'OK',
+              style: const TextStyle(color: Color(0xFF10B981)),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   void _startWalkQuest(DailyQuest quest) {
@@ -278,28 +319,15 @@ class _DailyQuestScreenState extends State<DailyQuestScreen> with SingleTickerPr
       return;
     }
 
-    // Add EXP to history
-    await QuestGenerationService.addExpToHistory(
-      uid: widget.uid,
-      amount: quest.expReward,
-      source: quest.titleId,
-    );
-
-    // Add to quest history
-    await QuestGenerationService.addQuestToHistory(
+    // Batch all Firestore writes into single transaction (optimized)
+    await QuestGenerationService.completeQuest(
       uid: widget.uid,
       questId: quest.id,
       questName: quest.titleId,
       expReward: quest.expReward,
       exerciseType: quest.type.name,
-    );
-
-    // Update quest progress
-    await QuestGenerationService.updateQuestProgress(
-      uid: widget.uid,
-      questId: quest.id,
       currentProgress: quest.target,
-      isCompleted: true,
+      source: quest.titleId,
     );
 
     setState(() {
@@ -309,12 +337,43 @@ class _DailyQuestScreenState extends State<DailyQuestScreen> with SingleTickerPr
     widget.onExpEarned(quest.expReward);
     widget.onQuestComplete();
 
+    // Check and unlock achievements
+    _checkAchievements(quest);
+
     // Refresh progress
     QuestGenerationService.getQuestProgress(widget.uid).then((progress) {
       if (mounted) {
         setState(() => _progress = progress);
       }
     });
+  }
+
+  void _checkAchievements(DailyQuest quest) async {
+    try {
+      // Get current quest counts from profile or default
+      final walkingCount = quest.type == QuestType.walk ? 1 : 0;
+      final hydrationCount = quest.type == QuestType.water ? 1 : 0;
+      final exerciseCount = quest.type == QuestType.exercise ? 1 : 0;
+
+      // Get total quests completed from quest progress
+      final progress = await QuestGenerationService.getQuestProgress(widget.uid);
+      final totalCompleted = progress.values.where((p) => p.isCompleted).length;
+
+      await AchievementService.checkAndUnlockAchievements(
+        uid: widget.uid,
+        questsCompleted: totalCompleted,
+        streakDays: widget.profile.streak,
+        totalExp: widget.profile.totalExp + quest.expReward,
+        level: widget.profile.level,
+        friendsCount: 0, // Not available in profile
+        walkingQuestsCompleted: walkingCount,
+        hydrationQuestsCompleted: hydrationCount,
+        exerciseQuestsCompleted: exerciseCount,
+        questCompletedAt: DateTime.now(),
+      );
+    } catch (e) {
+      // Silently fail - achievements are not critical
+    }
   }
 
   void _showExpLimitDialog() {
@@ -417,48 +476,6 @@ class _DailyQuestScreenState extends State<DailyQuestScreen> with SingleTickerPr
           ? const Center(child: CircularProgressIndicator(color: Color(0xFF10B981)))
           : Column(
               children: [
-                // Rest Mode Banner
-                if (_restModeActive)
-                  Container(
-                    margin: const EdgeInsets.fromLTRB(16, 16, 16, 0),
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: Colors.amber.withOpacity(0.1),
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: Colors.amber.withOpacity(0.3)),
-                    ),
-                    child: Row(
-                      children: [
-                        ScaleTransition(
-                          scale: _lockAnimation,
-                          child: const Icon(Icons.lock, color: Colors.amber, size: 24),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                _currentLang == 'id' ? 'Mode Istirahat Aktif' : 'Rest Mode Active',
-                                style: const TextStyle(
-                                  color: Colors.amber,
-                                  fontWeight: FontWeight.bold,
-                                  fontSize: 14,
-                                ),
-                              ),
-                              Text(
-                                _currentLang == 'id'
-                                    ? 'Nonaktifkan untuk menjalankan quest'
-                                    : 'Deactivate to start quests',
-                                style: const TextStyle(color: Colors.grey, fontSize: 11),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-
                 // Daily EXP Progress
                 Container(
                   padding: const EdgeInsets.all(16),

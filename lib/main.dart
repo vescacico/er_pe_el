@@ -3,8 +3,8 @@ import 'package:flutter/services.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:google_sign_in/google_sign_in.dart';
-import 'package:google_generative_ai/google_generative_ai.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:async';
 import 'quest_walk.dart';
 import 'firebase_options.dart';
@@ -17,6 +17,8 @@ import 'screens/daily_quest_screen.dart';
 import 'screens/hydration_quest_screen.dart';
 import 'screens/sick_mode_screen.dart';
 import 'screens/quest_list_screen.dart';
+import 'screens/onboarding_wizard.dart';
+import 'screens/fitness_chatbot_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -75,25 +77,61 @@ class _SplashScreenState extends State<SplashScreen> {
       if (user != null) {
         String displayName = user.displayName ?? 'Hunter';
         String? username;
+        bool onboardingCompleted = false;
         try {
+          // Check SharedPreferences first (faster)
+          final prefs = await SharedPreferences.getInstance();
+          onboardingCompleted = prefs.getBool('onboarding_completed') ?? false;
+
+          // Also check Firestore for more accurate state
           final doc = await FirebaseFirestore.instance.collection('users').doc(user.uid).get();
           if (doc.exists) {
             displayName = doc.data()?['displayName'] ?? displayName;
             username = doc.data()?['username'];
+            // Override with Firestore value if available
+            onboardingCompleted = doc.data()?['onboardingCompleted'] ?? false;
           }
         } catch (e) {
           // ignore
         }
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(
-            builder: (context) => MainNavScreen(
-              uid: user.uid,
-              displayName: displayName,
-            ),
-          ),
-        );
+
+        if (mounted) {
+          if (!onboardingCompleted) {
+            // Show onboarding wizard for new users or if onboarding not completed
+            Navigator.pushReplacement(
+              context,
+              MaterialPageRoute(
+                builder: (context) => OnboardingWizard(
+                  uid: user.uid,
+                  onComplete: () {
+                    Navigator.pushReplacement(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) => MainNavScreen(
+                          uid: user.uid,
+                          displayName: displayName,
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            );
+          } else {
+            // Existing user - go directly to main screen
+            Navigator.pushReplacement(
+              context,
+              MaterialPageRoute(
+                builder: (context) => MainNavScreen(
+                  uid: user.uid,
+                  displayName: displayName,
+                ),
+              ),
+            );
+          }
+        }
       } else {
+        // No logged in user - go to login screen
         Navigator.pushReplacement(
           context,
           MaterialPageRoute(builder: (context) => const LoginScreen()),
@@ -141,6 +179,7 @@ class LoginScreen extends StatefulWidget {
 
 class _LoginScreenState extends State<LoginScreen> {
   bool isLoginMode = true;
+  bool useEmailLogin = false; // Toggle between username and email login
   bool isPasswordVisible = false;
   bool isLoading = false;
   String _currentLang = 'id';
@@ -273,6 +312,17 @@ class _LoginScreenState extends State<LoginScreen> {
         return;
       }
 
+      // Password strength validation
+      final passwordErrors = _validatePasswordStrength(password);
+      if (passwordErrors.isNotEmpty) {
+        _showErrorDialog(
+          _currentLang == 'id' ? 'Password Lemah' : 'Weak Password',
+          passwordErrors,
+        );
+        setState(() => isLoading = false);
+        return;
+      }
+
       if (!RegExp(r'^[a-zA-Z0-9_]+$').hasMatch(username)) {
         _showErrorDialog(
           _currentLang == 'id' ? 'Username Tidak Valid' : 'Invalid Username',
@@ -318,8 +368,13 @@ class _LoginScreenState extends State<LoginScreen> {
         'streak': 0,
         'restModeActive': false,
         'language': _currentLang,
+        'onboardingCompleted': false, // New users need onboarding
         'createdAt': FieldValue.serverTimestamp(),
       });
+
+      // Also save to SharedPreferences
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('onboarding_completed', false);
 
       await user.sendEmailVerification();
 
@@ -463,6 +518,135 @@ class _LoginScreenState extends State<LoginScreen> {
     }
   }
 
+  // --- Fungsi Login dengan Username ---
+  Future<void> _signInWithUsername() async {
+    setState(() => isLoading = true);
+    try {
+      final username = _usernameController.text.trim();
+      final password = _passwordController.text.trim();
+
+      if (username.isEmpty || password.isEmpty) {
+        _showErrorDialog(
+          _currentLang == 'id' ? 'Data Tidak Lengkap' : 'Incomplete Data',
+          _currentLang == 'id' ? 'Harap isi username dan password!' : 'Please enter username and password!'
+        );
+        setState(() => isLoading = false);
+        return;
+      }
+
+      // Cari user berdasarkan username
+      final normalizedUsername = username.toLowerCase().trim();
+      final snapshot = await FirebaseFirestore.instance
+          .collection('users')
+          .where('usernameLower', isEqualTo: normalizedUsername)
+          .limit(1)
+          .get();
+
+      if (snapshot.docs.isEmpty) {
+        _showErrorDialog(
+          _currentLang == 'id' ? 'Login Gagal' : 'Login Failed',
+          _currentLang == 'id'
+              ? 'Username tidak ditemukan.'
+              : 'Username not found.'
+        );
+        setState(() => isLoading = false);
+        return;
+      }
+
+      final userData = snapshot.docs.first.data();
+      final uid = snapshot.docs.first.id;
+      final displayName = userData['displayName'] ?? 'Hunter';
+      final userEmail = userData['email'] as String?;
+
+      if (userEmail == null || userEmail.isEmpty) {
+        _showErrorDialog(
+          _currentLang == 'id' ? 'Login Gagal' : 'Login Failed',
+          _currentLang == 'id'
+              ? 'Akun ini tidak bisa login dengan username.'
+              : 'This account cannot login with username.'
+        );
+        setState(() => isLoading = false);
+        return;
+      }
+
+      // Login dengan email yang tersimpan
+      final credential = await _auth.signInWithEmailAndPassword(
+        email: userEmail,
+        password: password,
+      );
+
+      if (!credential.user!.emailVerified) {
+        await credential.user!.sendEmailVerification();
+        await _auth.signOut();
+        _showInfoDialog(
+          _currentLang == 'id' ? 'Email Belum Diverifikasi' : 'Email Not Verified',
+          _currentLang == 'id'
+              ? 'Email Anda belum diverifikasi.\n\nSilakan cek kotak masuk Anda.'
+              : 'Your email is not yet verified.\n\nPlease check your inbox.'
+        );
+        setState(() => isLoading = false);
+        return;
+      }
+
+      _navigateToHome(uid, displayName, username: username);
+    } on FirebaseAuthException catch (e) {
+      String message = _currentLang == 'id' ? 'Terjadi kesalahan.' : 'An error occurred.';
+      if (e.code == 'wrong-password') {
+        message = _currentLang == 'id'
+            ? 'Password salah.'
+            : 'Wrong password.';
+      } else if (e.code == 'user-disabled') {
+        message = _currentLang == 'id' ? 'Akun ini dinonaktifkan.' : 'This account is disabled.';
+      } else {
+        message = e.message ?? (_currentLang == 'id' ? 'Gagal login.' : 'Login failed.');
+      }
+      _showErrorDialog(_currentLang == 'id' ? 'Login Gagal' : 'Login Failed', message);
+    } catch (e) {
+      _showErrorDialog(_currentLang == 'id' ? 'Error' : 'Error', e.toString());
+    } finally {
+      if (mounted) setState(() => isLoading = false);
+    }
+  }
+
+  // --- Fungsi Validasi Password Strength ---
+  String _validatePasswordStrength(String password) {
+    if (password.length < 8) {
+      return _currentLang == 'id'
+          ? 'Password harus minimal 8 karakter!'
+          : 'Password must be at least 8 characters!';
+    }
+
+    bool hasUppercase = password.contains(RegExp(r'[A-Z]'));
+    bool hasLowercase = password.contains(RegExp(r'[a-z]'));
+    bool hasDigit = password.contains(RegExp(r'[0-9]'));
+    bool hasSpecialChar = password.contains(RegExp(r'[!@#$%^&*(),.?":{}|<>]'));
+
+    List<String> missing = [];
+
+    if (!hasUppercase) {
+      missing.add(_currentLang == 'id' ? 'Huruf besar (A-Z)' : 'Uppercase letter (A-Z)');
+    }
+    if (!hasLowercase) {
+      missing.add(_currentLang == 'id' ? 'Huruf kecil (a-z)' : 'Lowercase letter (a-z)');
+    }
+    if (!hasDigit) {
+      missing.add(_currentLang == 'id' ? 'Angka (0-9)' : 'Number (0-9)');
+    }
+    if (!hasSpecialChar) {
+      missing.add(_currentLang == 'id' ? 'Karakter khusus (!@#\$%^&*)' : 'Special character (!@#\$%^&*)');
+    }
+
+    if (missing.isNotEmpty) {
+      return (_currentLang == 'id'
+              ? 'Password harus mengandung:'
+              : 'Password must contain:') +
+          '\n• ' +
+          missing.join('\n• ');
+    }
+
+    return ''; // Password is valid
+  }
+
   // --- Fungsi Reset Password (Lupa Password) ---
   Future<void> _resetPassword() async {
     final email = _emailController.text.trim();
@@ -531,7 +715,9 @@ class _LoginScreenState extends State<LoginScreen> {
 
       final docRef = FirebaseFirestore.instance.collection('users').doc(user.uid);
       final doc = await docRef.get();
-      if (!doc.exists) {
+      bool isNewGoogleUser = !doc.exists;
+
+      if (isNewGoogleUser) {
         final displayName = user.displayName ?? 'Hunter';
         await docRef.set({
           'displayName': displayName,
@@ -544,19 +730,49 @@ class _LoginScreenState extends State<LoginScreen> {
           'streak': 0,
           'restModeActive': false,
           'language': _currentLang,
+          'onboardingCompleted': false, // New users need onboarding
           'createdAt': FieldValue.serverTimestamp(),
         });
+
+        // Also save to SharedPreferences
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setBool('onboarding_completed', false);
       }
 
       String displayName = user.displayName ?? 'Hunter';
       String? username;
+      bool onboardingCompleted = isNewGoogleUser ? false : true; // New users need onboarding
       if (doc.exists) {
         displayName = doc.data()?['displayName'] ?? displayName;
         username = doc.data()?['username'];
+        onboardingCompleted = doc.data()?['onboardingCompleted'] ?? false;
       }
 
       if (mounted) {
-        _navigateToHome(user.uid, displayName, username: username);
+        if (!onboardingCompleted) {
+          // Show onboarding wizard for new users or users who haven't completed onboarding
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(
+              builder: (context) => OnboardingWizard(
+                uid: user.uid,
+                onComplete: () {
+                  Navigator.pushReplacement(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => MainNavScreen(
+                        uid: user.uid,
+                        displayName: displayName,
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          );
+        } else {
+          _navigateToHome(user.uid, displayName, username: username);
+        }
       }
     } on FirebaseAuthException catch (e) {
       if (mounted) {
@@ -582,9 +798,44 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   // --- Navigasi ke Home ---
-  void _navigateToHome(String uid, String displayName, {String? username}) {
-    // Tampilkan welcome popup dengan animasi
-    _showWelcomeDialog(uid, displayName, username: username);
+  void _navigateToHome(String uid, String displayName, {String? username, bool onboardingCompleted = false}) {
+    // Check if this is a new user (no username yet = needs onboarding)
+    // OR if onboarding was not completed
+    bool needsOnboarding = !onboardingCompleted && (username == null || username.isEmpty);
+
+    if (needsOnboarding) {
+      // Show onboarding wizard for new users
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+          builder: (context) => OnboardingWizard(
+            uid: uid,
+            onComplete: () {
+              Navigator.pushReplacement(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => MainNavScreen(
+                    uid: uid,
+                    displayName: displayName,
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+      );
+    } else {
+      // Existing user - go directly to main screen
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+          builder: (context) => MainNavScreen(
+            uid: uid,
+            displayName: displayName,
+          ),
+        ),
+      );
+    }
   }
 
   // --- Welcome Dialog dengan tema Game ---
@@ -730,8 +981,8 @@ class _LoginScreenState extends State<LoginScreen> {
                 const SizedBox(height: 20),
                 Text(
                   isLoginMode
-                      ? (_currentLang == 'id' ? "SYSTEM LOGIN" : "SYSTEM LOGIN")
-                      : (_currentLang == 'id' ? "DAFTAR HUNTER" : "HUNTER REGISTRATION"),
+                      ? (_currentLang == 'id' ? "MASUK" : "LOGIN")
+                      : (_currentLang == 'id' ? "DAFTAR" : "REGISTER"),
                   textAlign: TextAlign.center,
                   style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold, color: Colors.white, letterSpacing: 2),
                 ),
@@ -739,11 +990,11 @@ class _LoginScreenState extends State<LoginScreen> {
                 Text(
                   isLoginMode
                       ? (_currentLang == 'id'
-                          ? "Selamat datang kembali, Hunter. Masukkan kredensial Anda."
-                          : "Welcome back, Hunter. Enter your credentials.")
+                          ? "Masukkan username dan password Anda."
+                          : "Enter your username and password.")
                       : (_currentLang == 'id'
-                          ? "Inisialisasi profil Anda untuk bergabung."
-                          : "Initialize your profile to join the system."),
+                          ? "Lengkapi data untuk membuat akun."
+                          : "Fill in the details to create an account."),
                   textAlign: TextAlign.center,
                   style: const TextStyle(color: Colors.grey, fontStyle: FontStyle.italic),
                 ),
@@ -754,7 +1005,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   _buildTextField(
                     controller: _nameController,
                     icon: Icons.person,
-                    hint: _currentLang == 'id' ? "Nama Hunter" : "Hunter Name",
+                    hint: _currentLang == 'id' ? "Nama" : "Name",
                   ),
                   const SizedBox(height: 15),
                   _buildTextField(
@@ -763,15 +1014,13 @@ class _LoginScreenState extends State<LoginScreen> {
                     hint: _currentLang == 'id' ? "Username (unik)" : "Username (unique)",
                   ),
                   const SizedBox(height: 15),
+                  _buildTextField(
+                    controller: _emailController,
+                    icon: Icons.email,
+                    hint: _currentLang == 'id' ? "Email" : "Email",
+                  ),
+                  const SizedBox(height: 15),
                 ],
-
-                // Field Email
-                _buildTextField(
-                  controller: _emailController,
-                  icon: Icons.email,
-                  hint: _currentLang == 'id' ? "Alamat Email" : "Email Address",
-                ),
-                const SizedBox(height: 15),
 
                 // Field Password
                 _buildTextField(
@@ -782,8 +1031,8 @@ class _LoginScreenState extends State<LoginScreen> {
                 ),
                 const SizedBox(height: 8),
 
-                // Tombol Lupa Password (hanya di mode Login)
-                if (isLoginMode) ...[
+                // Tombol Lupa Password (hanya di mode Login dengan email)
+                if (isLoginMode && useEmailLogin) ...[
                   Align(
                     alignment: Alignment.centerRight,
                     child: TextButton(
@@ -805,10 +1054,12 @@ class _LoginScreenState extends State<LoginScreen> {
                     ? const Center(child: CircularProgressIndicator(color: Color(0xFF10B981)))
                     : ElevatedButton(
                         onPressed: () {
-                          if (isLoginMode) {
+                          if (!isLoginMode) {
+                            _signUpWithEmail();
+                          } else if (useEmailLogin) {
                             _signInWithEmail();
                           } else {
-                            _signUpWithEmail();
+                            _signInWithUsername();
                           }
                         },
                         style: ElevatedButton.styleFrom(
@@ -818,11 +1069,37 @@ class _LoginScreenState extends State<LoginScreen> {
                         ),
                         child: Text(
                           isLoginMode
-                              ? (_currentLang == 'id' ? "MASUK SISTEM" : "ACCESS SYSTEM")
-                              : (_currentLang == 'id' ? "INITIALISASI SISTEM" : "INITIALIZE SYSTEM"),
+                              ? (_currentLang == 'id' ? "MASUK" : "LOGIN")
+                              : (_currentLang == 'id' ? "DAFTAR" : "REGISTER"),
                           style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.black, letterSpacing: 2),
                         ),
                       ),
+
+                // Toggle Email Login (hanya di mode Login)
+                if (isLoginMode) ...[
+                  const SizedBox(height: 12),
+                  GestureDetector(
+                    onTap: () => setState(() => useEmailLogin = !useEmailLogin),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF10B981).withOpacity(0.1),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Text(
+                        useEmailLogin
+                            ? (_currentLang == 'id' ? "Login dengan username" : "Login with username")
+                            : (_currentLang == 'id' ? "Login dengan email" : "Login with email"),
+                        style: const TextStyle(
+                          color: Color(0xFF10B981),
+                          fontSize: 12,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  ),
+                ],
+
                 const SizedBox(height: 20),
 
                 // Toggle Login / Sign Up
@@ -832,7 +1109,7 @@ class _LoginScreenState extends State<LoginScreen> {
                     Text(
                       isLoginMode
                           ? (_currentLang == 'id' ? "Tidak punya akun? " : "Don't have an account? ")
-                          : (_currentLang == 'id' ? "Sudah Hunter? " : "Already a Hunter? "),
+                          : (_currentLang == 'id' ? "Sudah punya akun? " : "Already have an account? "),
                       style: const TextStyle(color: Colors.grey),
                     ),
                     GestureDetector(
@@ -1140,7 +1417,6 @@ class _HomeScreenState extends State<HomeScreen> {
   int? age;
   double? dailyWaterNeed;
 
-  bool isAiLoading = false;
   bool isDbLoading = true;
   String _currentLang = 'id';
 
@@ -1155,6 +1431,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // Sick Mode
   SickModeData? _sickModeData;
+  bool _isSickModeActive = false;
 
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
@@ -1172,7 +1449,10 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       final data = await SickModeService.getSickModeData(widget.uid);
       if (mounted) {
-        setState(() => _sickModeData = data);
+        setState(() {
+          _sickModeData = data;
+          _isSickModeActive = data?.isActive ?? false;
+        });
       }
     } catch (e) {
       debugPrint('Error checking sick mode: $e');
@@ -1372,43 +1652,34 @@ class _HomeScreenState extends State<HomeScreen> {
     }, SetOptions(merge: true));
   }
 
-  Future<void> triggerSystemMessage() async {
-    setState(() => isAiLoading = true);
-    try {
-      const apiKey = String.fromEnvironment('GEMINI_API_KEY'); //isi api key disini
-      final model = GenerativeModel(model: 'gemini-1.5-flash', apiKey: apiKey);
-      final prompt = _currentLang == 'id'
-          ? "Kamu adalah 'The System', AI pengawas RPG. Berikan 1 pesan peringatan/motivasi singkat untuk Hunter $playerName. Maks 2 kalimat."
-          : "You are 'The System', an RPG supervisor AI. Give 1 brief warning/motivational message for Hunter $playerName. Max 2 sentences.";
-      final response = await model.generateContent([Content.text(prompt)]);
-      setState(() => isAiLoading = false);
-      _showSystemDialog(response.text ?? (_currentLang == 'id' ? "Sistem gagal merespon." : "System failed to respond."));
-    } catch (e) {
-      setState(() => isAiLoading = false);
-      _showSystemDialog(_currentLang == 'id' ? "Koneksi ke Sistem Pusat terputus." : "Connection to Central System lost.");
-    }
-  }
+  void _openFitnessChatbot() async {
+    // Load user profile for context
+    final profile = UserProfileData(
+      uid: widget.uid,
+      displayName: playerName,
+      rank: rank,
+      level: level,
+      currentExp: currentExp,
+      expToNextLevel: expToNextLevel,
+      totalExp: totalExp,
+      streak: streak,
+      restModeActive: false,
+      language: _currentLang,
+      heightCm: heightCm,
+      weightKg: weightKg,
+      birthDate: birthDate,
+      bmi: bmi,
+      age: age,
+      dailyWaterNeedMl: dailyWaterNeed,
+    );
 
-  void _showSystemDialog(String message) {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: Colors.black87,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16), side: const BorderSide(color: Color(0xFF10B981))),
-        title: Text(
-          _currentLang == 'id' ? "PESAN SISTEM" : "SYSTEM MESSAGE",
-          style: const TextStyle(color: Color(0xFF10B981), fontWeight: FontWeight.bold),
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => FitnessChatbotScreen(
+          uid: widget.uid,
+          profile: profile,
         ),
-        content: Text(message, style: const TextStyle(color: Colors.white, fontStyle: FontStyle.italic)),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: Text(
-              _currentLang == 'id' ? "Terverifikasi" : "Acknowledge",
-              style: const TextStyle(color: Colors.grey),
-            ),
-          ),
-        ],
       ),
     );
   }
@@ -1514,6 +1785,7 @@ class _HomeScreenState extends State<HomeScreen> {
           onExpEarned: (exp) {
             addExp(exp);
           },
+          isSickModeActive: _isSickModeActive,
         ),
       ),
     ).then((_) {
@@ -1531,6 +1803,7 @@ class _HomeScreenState extends State<HomeScreen> {
           refreshHome: () {
             _loadDailyQuests();
           },
+          isSickModeActive: _isSickModeActive,
         ),
       ),
     );
@@ -1630,15 +1903,11 @@ class _HomeScreenState extends State<HomeScreen> {
                       _currentLang == 'id' ? 'FitTask System' : 'FitTask System',
                       style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 20),
                     ),
-                    isAiLoading
-                        ? const Padding(
-                            padding: EdgeInsets.all(8.0),
-                            child: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Color(0xFF10B981), strokeWidth: 2)),
-                          )
-                        : IconButton(
-                            icon: const Icon(Icons.remove_red_eye, color: Color(0xFF10B981), size: 26),
-                            onPressed: triggerSystemMessage,
-                          ),
+                    IconButton(
+                      icon: const Icon(Icons.chat_bubble, color: Color(0xFF10B981), size: 26),
+                      tooltip: _currentLang == 'id' ? 'Asisten Kebugaran' : 'Fitness Assistant',
+                      onPressed: _openFitnessChatbot,
+                    ),
                   ],
                 ),
                 const SizedBox(height: 12),
@@ -1756,6 +2025,31 @@ class _HomeScreenState extends State<HomeScreen> {
                 const SizedBox(height: 12),
 
                 // Quick Quest Buttons
+                if (_isSickModeActive) ...[
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: Colors.orange.withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.orange.withOpacity(0.3)),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.info_outline, color: Colors.orange, size: 16),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            _currentLang == 'id'
+                                ? 'Mode Terbatas aktif - Quest disesuaikan dengan kondisimu'
+                                : 'Limited Mode active - Quests adjusted to your condition',
+                            style: const TextStyle(color: Colors.orange, fontSize: 11),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                ],
                 Wrap(
                   spacing: 8,
                   runSpacing: 8,
@@ -1764,7 +2058,9 @@ class _HomeScreenState extends State<HomeScreen> {
                       icon: Icons.directions_walk,
                       label: _currentLang == 'id' ? "Jalan" : "Walk",
                       color: Colors.blue,
+                      isDisabled: _isSickModeActive,
                       onTap: () {
+                        if (_isSickModeActive) return;
                         final walkQuest = dailyQuests.where((q) => q.type == QuestType.walk).firstOrNull;
                         if (walkQuest != null) {
                           Navigator.push(
@@ -1794,7 +2090,9 @@ class _HomeScreenState extends State<HomeScreen> {
                       icon: Icons.water_drop,
                       label: _currentLang == 'id' ? "Air" : "Water",
                       color: Colors.cyan,
+                      isDisabled: _isSickModeActive,
                       onTap: () {
+                        if (_isSickModeActive) return;
                         final waterQuest = dailyQuests.where((q) => q.type == QuestType.water).firstOrNull;
                         if (waterQuest != null && weightKg != null) {
                           Navigator.push(
@@ -1819,7 +2117,11 @@ class _HomeScreenState extends State<HomeScreen> {
                       icon: Icons.fitness_center,
                       label: _currentLang == 'id' ? "Latihan" : "Exercise",
                       color: Colors.orange,
-                      onTap: _openExerciseQuests,
+                      isDisabled: _isSickModeActive,
+                      onTap: () {
+                        if (_isSickModeActive) return;
+                        _openExerciseQuests();
+                      },
                     ),
                   ],
                 ),
@@ -1884,25 +2186,36 @@ class _HomeScreenState extends State<HomeScreen> {
     required String label,
     required Color color,
     required VoidCallback onTap,
+    bool isDisabled = false,
   }) {
     return Material(
       color: Colors.transparent,
       child: InkWell(
-        onTap: onTap,
+        onTap: isDisabled ? null : onTap,
         borderRadius: BorderRadius.circular(20),
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
           decoration: BoxDecoration(
-            color: color.withOpacity(0.1),
+            color: isDisabled ? Colors.grey.withOpacity(0.2) : color.withOpacity(0.1),
             borderRadius: BorderRadius.circular(20),
-            border: Border.all(color: color.withOpacity(0.3)),
+            border: Border.all(color: isDisabled ? Colors.grey.withOpacity(0.3) : color.withOpacity(0.3)),
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(icon, color: color, size: 18),
+              Icon(icon, color: isDisabled ? Colors.grey : color, size: 18),
               const SizedBox(width: 8),
-              Text(label, style: TextStyle(color: color, fontWeight: FontWeight.bold)),
+              Text(
+                label,
+                style: TextStyle(
+                  color: isDisabled ? Colors.grey : color,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              if (isDisabled) ...[
+                const SizedBox(width: 4),
+                const Icon(Icons.lock, color: Colors.grey, size: 14),
+              ],
             ],
           ),
         ),

@@ -245,6 +245,10 @@ class _HydrationQuestScreenState extends State<HydrationQuestScreen> {
           _currentLang == 'id' ? 'Quest Hidrasi' : 'Hydration Quest',
           style: const TextStyle(fontWeight: FontWeight.bold),
         ),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back, color: Colors.white),
+          onPressed: () => Navigator.pop(context),
+        ),
       ),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator(color: Color(0xFF10B981)))
@@ -405,17 +409,43 @@ class _HydrationQuestScreenState extends State<HydrationQuestScreen> {
   }
 
   Widget _buildQuickAddSection() {
+    final isTargetReached = _currentIntakeMl >= widget.dailyTargetMl;
+
     return Column(
       children: [
-        Text(
-          _currentLang == 'id'
-              ? 'Tambah Air Cepat'
-              : 'Quick Add Water',
-          style: const TextStyle(
-            color: Colors.white70,
-            fontSize: 14,
-            fontWeight: FontWeight.bold,
-          ),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(
+              _currentLang == 'id'
+                  ? 'Tambah Air Cepat'
+                  : 'Quick Add Water',
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: 14,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            if (isTargetReached)
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: Colors.green.withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.lock, color: Colors.green, size: 12),
+                    const SizedBox(width: 4),
+                    Text(
+                      _currentLang == 'id' ? 'Selesai' : 'Completed',
+                      style: const TextStyle(color: Colors.green, fontSize: 11, fontWeight: FontWeight.bold),
+                    ),
+                  ],
+                ),
+              ),
+          ],
         ),
         const SizedBox(height: 12),
         Wrap(
@@ -423,7 +453,7 @@ class _HydrationQuestScreenState extends State<HydrationQuestScreen> {
           runSpacing: 10,
           alignment: WrapAlignment.center,
           children: _glassSizes.map((size) {
-            return _buildGlassButton(size);
+            return _buildGlassButton(size, isTargetReached);
           }).toList(),
         ),
       ],
@@ -431,14 +461,17 @@ class _HydrationQuestScreenState extends State<HydrationQuestScreen> {
   }
 
   Widget _buildCustomAmountSection() {
+    final isTargetReached = _currentIntakeMl >= widget.dailyTargetMl;
+    final isDisabled = isTargetReached || _isSaving;
+
     return Column(
       children: [
         Text(
           _currentLang == 'id'
               ? 'Atau masukkan jumlah lain'
               : 'Or enter custom amount',
-          style: const TextStyle(
-            color: Colors.grey,
+          style: TextStyle(
+            color: isDisabled ? Colors.grey : Colors.grey,
             fontSize: 11,
           ),
         ),
@@ -447,10 +480,10 @@ class _HydrationQuestScreenState extends State<HydrationQuestScreen> {
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             IconButton(
-              onPressed: _isSaving ? null : () => _removeWater(100),
-              icon: const Icon(
+              onPressed: isDisabled ? null : () => _removeWater(100),
+              icon: Icon(
                 Icons.remove_circle_outline,
-                color: Colors.red,
+                color: isDisabled ? Colors.grey : Colors.red,
                 size: 32,
               ),
             ),
@@ -464,13 +497,15 @@ class _HydrationQuestScreenState extends State<HydrationQuestScreen> {
               decoration: BoxDecoration(
                 color: const Color(0xFF111111),
                 borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: Colors.cyan.withOpacity(0.3)),
+                border: Border.all(
+                  color: isDisabled ? Colors.grey.withOpacity(0.3) : Colors.cyan.withOpacity(0.3)
+                ),
               ),
               child: Text(
                 '$_currentIntakeMl ml',
                 textAlign: TextAlign.center,
-                style: const TextStyle(
-                  color: Colors.white,
+                style: TextStyle(
+                  color: isDisabled ? Colors.grey : Colors.white,
                   fontWeight: FontWeight.bold,
                   fontSize: 14,
                 ),
@@ -478,10 +513,10 @@ class _HydrationQuestScreenState extends State<HydrationQuestScreen> {
             ),
             const SizedBox(width: 12),
             IconButton(
-              onPressed: _isSaving ? null : () => _addWater(100),
-              icon: const Icon(
+              onPressed: isDisabled ? null : () => _addWater(100),
+              icon: Icon(
                 Icons.add_circle_outline,
-                color: Colors.cyan,
+                color: isDisabled ? Colors.grey : Colors.cyan,
                 size: 32,
               ),
             ),
@@ -522,7 +557,7 @@ class _HydrationQuestScreenState extends State<HydrationQuestScreen> {
     );
   }
 
-  Widget _buildGlassButton(int ml) {
+  Widget _buildGlassButton(int ml, bool isLocked) {
     IconData icon;
     String label;
 
@@ -543,27 +578,36 @@ class _HydrationQuestScreenState extends State<HydrationQuestScreen> {
       label = '$ml ml';
     }
 
+    // Disable button if target is already reached
+    final bool isDisabled = isLocked || _isSaving;
+
     return Material(
       color: Colors.transparent,
       child: InkWell(
-        onTap: _isSaving ? null : () => _addWater(ml),
+        onTap: isDisabled ? null : () => _addWater(ml),
         borderRadius: BorderRadius.circular(14),
         child: Container(
           width: 70,
           padding: const EdgeInsets.symmetric(vertical: 12),
           decoration: BoxDecoration(
-            color: const Color(0xFF111111),
+            color: isDisabled ? const Color(0xFF111111).withOpacity(0.5) : const Color(0xFF111111),
             borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: Colors.cyan.withOpacity(0.3)),
+            border: Border.all(
+              color: isDisabled ? Colors.grey.withOpacity(0.3) : Colors.cyan.withOpacity(0.3),
+            ),
           ),
           child: Column(
             children: [
-              Icon(icon, color: Colors.cyan, size: 24),
+              Icon(
+                icon,
+                color: isDisabled ? Colors.grey : Colors.cyan,
+                size: 24,
+              ),
               const SizedBox(height: 6),
               Text(
                 label,
-                style: const TextStyle(
-                  color: Colors.white,
+                style: TextStyle(
+                  color: isDisabled ? Colors.grey : Colors.white,
                   fontSize: 11,
                   fontWeight: FontWeight.bold,
                 ),

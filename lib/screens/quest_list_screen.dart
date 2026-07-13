@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import '../services/exercise_database.dart';
 import '../services/language_service.dart';
 import 'exercise_detail_screen.dart';
@@ -8,12 +9,14 @@ class QuestListScreen extends StatefulWidget {
   final String uid;
   final void Function(int) addExp;
   final VoidCallback refreshHome;
+  final bool isSickModeActive; // Pass sick mode status from parent
 
   const QuestListScreen({
     super.key,
     required this.uid,
     required this.addExp,
     required this.refreshHome,
+    this.isSickModeActive = false,
   });
 
   @override
@@ -24,6 +27,7 @@ class _QuestListScreenState extends State<QuestListScreen>
     with SingleTickerProviderStateMixin {
   late TabController _tabController;
   String get _langCode => LanguageService.getCurrentLanguage();
+  String _searchQuery = '';
 
   // Exercise quests dengan metadata lengkap
   final List<Map<String, dynamic>> _exerciseQuests = [
@@ -95,6 +99,18 @@ class _QuestListScreenState extends State<QuestListScreen>
     {'exercise_id': 'tricep_dip', 'sets': 3, 'reps': 10, 'rest': 30, 'exp': 25, 'time_limit': 150,
      'is_static': false, 'requires_gym': false, 'category': 'arms'},
 
+    // ==================== SHOULDER EXERCISES ====================
+    {'exercise_id': 'arm_circle', 'sets': 2, 'reps': 30, 'rest': 20, 'exp': 15, 'time_limit': 120,
+     'is_static': false, 'requires_gym': false, 'category': 'shoulders'},
+    {'exercise_id': 'front_raise', 'sets': 3, 'reps': 12, 'rest': 30, 'exp': 20, 'time_limit': 120,
+     'is_static': false, 'requires_gym': false, 'category': 'shoulders'},
+    {'exercise_id': 'lateral_raise', 'sets': 3, 'reps': 12, 'rest': 30, 'exp': 20, 'time_limit': 120,
+     'is_static': false, 'requires_gym': false, 'category': 'shoulders'},
+    {'exercise_id': 'shoulder_tap', 'sets': 3, 'reps': 20, 'rest': 30, 'exp': 25, 'time_limit': 150,
+     'is_static': false, 'requires_gym': false, 'category': 'shoulders'},
+    {'exercise_id': 'pike_push_up', 'sets': 3, 'reps': 10, 'rest': 45, 'exp': 35, 'time_limit': 180,
+     'is_static': false, 'requires_gym': false, 'category': 'shoulders'},
+
     // ==================== GYM EXERCISES (requires equipment) ====================
     {'exercise_id': 'bench_press', 'sets': 3, 'reps': 10, 'rest': 60, 'exp': 40, 'time_limit': 240,
      'is_static': false, 'requires_gym': true, 'category': 'gym'},
@@ -124,6 +140,34 @@ class _QuestListScreenState extends State<QuestListScreen>
 
   @override
   Widget build(BuildContext context) {
+    // Show sick mode warning banner
+    Widget? sickModeWarning;
+    if (widget.isSickModeActive) {
+      sickModeWarning = Container(
+        margin: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Colors.orange.withOpacity(0.1),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.orange.withOpacity(0.3)),
+        ),
+        child: Row(
+          children: [
+            const Icon(Icons.warning_amber, color: Colors.orange, size: 20),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                _langCode == 'id'
+                    ? 'Mode Terbatas aktif - Quest telah disesuaikan dengan kondisimu'
+                    : 'Limited Mode active - Quests have been adjusted to your condition',
+                style: const TextStyle(color: Colors.orange, fontSize: 12),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
@@ -157,19 +201,46 @@ class _QuestListScreenState extends State<QuestListScreen>
           ],
         ),
       ),
-      body: TabBarView(
-        controller: _tabController,
+      body: Column(
         children: [
-          _buildQuestList('all'),
-          _buildQuestList('no_equipment'),
-          _buildQuestList('gym'),
-          _buildQuestList('chest'),
-          _buildQuestList('core'),
-          _buildQuestList('legs'),
-          _buildQuestList('cardio'),
-          _buildQuestList('back'),
-          _buildQuestList('arms'),
-          _buildQuestList('shoulders'),
+          if (sickModeWarning != null) sickModeWarning,
+          // Search bar
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+            child: TextField(
+              onChanged: (value) => setState(() => _searchQuery = value.toLowerCase()),
+              style: const TextStyle(color: Colors.white),
+              decoration: InputDecoration(
+                hintText: _langCode == 'id' ? 'Cari latihan...' : 'Search exercises...',
+                hintStyle: TextStyle(color: Colors.grey.shade600),
+                prefixIcon: Icon(Icons.search, color: Colors.grey.shade600),
+                filled: true,
+                fillColor: const Color(0xFF1A1A1A),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide.none,
+                ),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              ),
+            ),
+          ),
+          Expanded(
+            child: TabBarView(
+              controller: _tabController,
+              children: [
+                _buildQuestList('all'),
+                _buildQuestList('no_equipment'),
+                _buildQuestList('gym'),
+                _buildQuestList('chest'),
+                _buildQuestList('core'),
+                _buildQuestList('legs'),
+                _buildQuestList('cardio'),
+                _buildQuestList('back'),
+                _buildQuestList('arms'),
+                _buildQuestList('shoulders'),
+              ],
+            ),
+          ),
         ],
       ),
     );
@@ -194,15 +265,28 @@ class _QuestListScreenState extends State<QuestListScreen>
       }).toList();
     }
 
+    // Apply search filter
+    if (_searchQuery.isNotEmpty) {
+      filteredQuests = filteredQuests.where((quest) {
+        final exercise = ExerciseDatabase.getExerciseById(quest['exercise_id']);
+        if (exercise == null) return false;
+        final nameId = exercise.nameId.toLowerCase();
+        final nameEn = exercise.nameEn.toLowerCase();
+        return nameId.contains(_searchQuery) || nameEn.contains(_searchQuery);
+      }).toList();
+    }
+
     if (filteredQuests.isEmpty) {
       return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const Icon(Icons.fitness_center, size: 64, color: Colors.grey),
+            Icon(Icons.search_off, size: 64, color: Colors.grey.shade700),
             const SizedBox(height: 16),
             Text(
-              _langCode == 'id' ? 'Tidak ada quest tersedia' : 'No quests available',
+              _searchQuery.isNotEmpty
+                  ? (_langCode == 'id' ? 'Tidak ditemukan' : 'Not found')
+                  : (_langCode == 'id' ? 'Tidak ada quest tersedia' : 'No quests available'),
               style: const TextStyle(color: Colors.grey, fontSize: 16),
             ),
           ],
@@ -244,18 +328,17 @@ class _QuestListScreenState extends State<QuestListScreen>
     final isStatic = questData['is_static'] == true;
     final sets = questData['sets'];
     final reps = questData['reps'];
-    final timeLimit = questData['time_limit'];
 
     if (isStatic) {
       // Static exercises: "Hold [reps] seconds × [sets] sets"
       return _langCode == 'id'
-          ? 'Tahan $reps detik × $sets set\nWaktu maksimal: ${_formatTime(timeLimit)}'
-          : 'Hold $reps seconds × $sets sets\nMax time: ${_formatTime(timeLimit)}';
+          ? 'Tahan $reps detik × $sets set\nWaktu maksimal: 3 menit'
+          : 'Hold $reps seconds × $sets sets\nMax time: 3 minutes';
     } else {
       // Rep-based exercises: show sets and reps with time
       return _langCode == 'id'
-          ? '$sets set × $reps repetisi\nSelesaikan dalam: ${_formatTime(timeLimit)}'
-          : '$sets sets × $reps repetitions\nComplete within: ${_formatTime(timeLimit)}';
+          ? '$sets set × $reps repetisi\nWaktu maksimal: 3 menit'
+          : '$sets sets × $reps repetitions\nMax time: 3 minutes';
     }
   }
 
@@ -467,8 +550,8 @@ class _QuestListScreenState extends State<QuestListScreen>
                       const SizedBox(width: 6),
                       Text(
                         _langCode == 'id'
-                            ? 'Batas waktu total: ${_formatTime(timeLimit)}'
-                            : 'Total time limit: ${_formatTime(timeLimit)}',
+                            ? 'Waktu maksimal: 3 menit'
+                            : 'Max time: 3 minutes',
                         style: const TextStyle(color: Colors.amber, fontSize: 11),
                       ),
                     ],
@@ -502,33 +585,48 @@ class _QuestListScreenState extends State<QuestListScreen>
                     const SizedBox(width: 12),
                     Expanded(
                       child: ElevatedButton(
-                        onPressed: () {
-                          Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                              builder: (context) => ExerciseQuestScreen(
-                                uid: widget.uid,
-                                exercise: exercise,
-                                sets: sets,
-                                reps: reps,
-                                restSeconds: questData['rest'],
-                                expReward: questData['exp'],
-                                isStaticExercise: isStatic,
-                                onSuccess: () {
-                                  widget.addExp(questData['exp']);
-                                  widget.refreshHome();
-                                },
-                              ),
-                            ),
-                          );
-                        },
+                        onPressed: widget.isSickModeActive
+                            ? null  // Disable exercise when sick mode is active
+                            : () {
+                                Navigator.push(
+                                  context,
+                                  MaterialPageRoute(
+                                    builder: (context) => ExerciseQuestScreen(
+                                      uid: widget.uid,
+                                      exercise: exercise,
+                                      sets: sets,
+                                      reps: reps,
+                                      restSeconds: questData['rest'],
+                                      expReward: questData['exp'],
+                                      isStaticExercise: isStatic,
+                                      onSuccess: () {
+                                        widget.addExp(questData['exp']);
+                                        widget.refreshHome();
+                                      },
+                                    ),
+                                  ),
+                                );
+                              },
                         style: ElevatedButton.styleFrom(
-                          backgroundColor: requiresGym ? Colors.purple : categoryColor,
+                          backgroundColor: widget.isSickModeActive
+                              ? Colors.grey
+                              : (requiresGym ? Colors.purple : categoryColor),
                           padding: const EdgeInsets.symmetric(vertical: 12),
                         ),
-                        child: Text(
-                          t('start_exercise'),
-                          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            if (widget.isSickModeActive) ...[
+                              const Icon(Icons.lock, color: Colors.white, size: 16),
+                              const SizedBox(width: 4),
+                            ],
+                            Text(
+                              widget.isSickModeActive
+                                  ? (_langCode == 'id' ? 'Mode Terbatas' : 'Limited Mode')
+                                  : t('start_exercise'),
+                              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                            ),
+                          ],
                         ),
                       ),
                     ),
@@ -555,10 +653,23 @@ class _QuestListScreenState extends State<QuestListScreen>
         ),
         child: ClipRRect(
           borderRadius: BorderRadius.circular(12),
-          child: Image.network(
-            images['start']!,
+          child: CachedNetworkImage(
+            imageUrl: images['start']!,
             fit: BoxFit.cover,
-            errorBuilder: (_, __, ___) => Container(
+            placeholder: (context, url) => Container(
+              decoration: BoxDecoration(
+                color: categoryColor.withValues(alpha: 0.2),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: const Center(
+                child: SizedBox(
+                  width: 20,
+                  height: 20,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              ),
+            ),
+            errorWidget: (context, url, error) => Container(
               decoration: BoxDecoration(
                 color: categoryColor.withValues(alpha: 0.2),
                 borderRadius: BorderRadius.circular(12),

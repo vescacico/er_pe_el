@@ -70,6 +70,43 @@ class _LeaderboardScreenState extends State<LeaderboardScreen> with SingleTicker
     ).then((_) => _loadFriends());
   }
 
+  // Send nudge to friend
+  Future<void> _sendNudge(Friend friend) async {
+    final success = await FriendService.sendNudge(
+      fromUid: widget.currentUid,
+      fromName: widget.currentDisplayName,
+      toUid: friend.uid,
+      toName: friend.displayName,
+    );
+
+    if (mounted) {
+      if (success) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              _currentLang == 'id'
+                  ? 'Nudge terkirim ke ${friend.displayName}! 💪'
+                  : 'Nudge sent to ${friend.displayName}! 💪',
+            ),
+            backgroundColor: const Color(0xFF10B981),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              _currentLang == 'id'
+                  ? 'Gagal mengirim nudge'
+                  : 'Failed to send nudge',
+            ),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -221,73 +258,122 @@ class _LeaderboardScreenState extends State<LeaderboardScreen> with SingleTicker
           width: rank <= 3 ? 2 : 1,
         ),
       ),
-      child: ListTile(
-        leading: Container(
-          width: 40,
-          height: 40,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            color: rankColor != Colors.grey ? rankColor : Colors.black,
-          ),
-          child: Center(
-            child: Text(
-              '#$rank',
-              style: TextStyle(
-                color: rankColor != Colors.grey ? Colors.black : Colors.grey,
-                fontWeight: FontWeight.bold,
-                fontSize: 12,
-              ),
-            ),
-          ),
-        ),
-        title: Row(
-          children: [
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    friend.displayName,
-                    style: const TextStyle(
-                      color: Colors.white,
+      child: InkWell(
+        onTap: () => _sendNudge(friend),
+        borderRadius: BorderRadius.circular(12),
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Row(
+            children: [
+              // Rank badge
+              Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: rankColor != Colors.grey ? rankColor : Colors.black,
+                ),
+                child: Center(
+                  child: Text(
+                    '#$rank',
+                    style: TextStyle(
+                      color: rankColor != Colors.grey ? Colors.black : Colors.grey,
                       fontWeight: FontWeight.bold,
+                      fontSize: 12,
                     ),
                   ),
-                  if (friend.username != null && friend.username!.isNotEmpty)
-                    Text(
-                      '@${friend.username}',
-                      style: const TextStyle(color: Colors.grey, fontSize: 11),
-                    ),
-                ],
-              ),
-            ),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-              decoration: BoxDecoration(
-                color: Colors.amber.withOpacity(0.2),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Text(
-                'Lv. ${friend.level}',
-                style: const TextStyle(
-                  color: Colors.amber,
-                  fontSize: 11,
-                  fontWeight: FontWeight.bold,
                 ),
               ),
-            ),
-          ],
-        ),
-        subtitle: Text(
-          friend.rank,
-          style: const TextStyle(color: Colors.grey, fontSize: 12),
-        ),
-        trailing: Text(
-          '${friend.totalExp} EXP',
-          style: const TextStyle(
-            color: Color(0xFF10B981),
-            fontWeight: FontWeight.bold,
-            fontSize: 13,
+              const SizedBox(width: 12),
+
+              // User info
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                friend.displayName,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 15,
+                                ),
+                              ),
+                              if (friend.username != null && friend.username!.isNotEmpty)
+                                Text(
+                                  '@${friend.username}',
+                                  style: const TextStyle(color: Color(0xFF10B981), fontSize: 12),
+                                ),
+                            ],
+                          ),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF10B981).withOpacity(0.2),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: Text(
+                            '${friend.totalExp} EXP',
+                            style: const TextStyle(
+                              color: Color(0xFF10B981),
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: Colors.amber.withOpacity(0.2),
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          child: Text(
+                            'Lv. ${friend.level}',
+                            style: const TextStyle(
+                              color: Colors.amber,
+                              fontSize: 10,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          friend.rank,
+                          style: const TextStyle(color: Colors.grey, fontSize: 10),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+
+              // Nudge button
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF10B981).withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Icon(
+                  Icons.touch_app,
+                  color: Color(0xFF10B981),
+                  size: 20,
+                ),
+              ),
+            ],
           ),
         ),
       ),
